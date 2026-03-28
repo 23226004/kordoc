@@ -4,13 +4,14 @@ import { readFileSync, writeFileSync } from "fs"
 import { basename, resolve } from "path"
 import { Command } from "commander"
 import { parse, detectFormat } from "./index.js"
+import { VERSION, toArrayBuffer } from "./utils.js"
 
 const program = new Command()
 
 program
   .name("kordoc")
   .description("모두 파싱해버리겠다 — HWP, HWPX, PDF → Markdown")
-  .version("0.1.0")
+  .version(VERSION)
   .argument("<files...>", "변환할 파일 경로 (HWP, HWPX, PDF)")
   .option("-o, --output <path>", "출력 파일 경로 (단일 파일 시)")
   .option("-d, --out-dir <dir>", "출력 디렉토리 (다중 파일 시)")
@@ -23,7 +24,7 @@ program
 
       try {
         const buffer = readFileSync(absPath)
-        const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+        const arrayBuffer = toArrayBuffer(buffer)
         const format = detectFormat(arrayBuffer)
 
         if (!opts.silent) {
@@ -43,7 +44,7 @@ program
 
         const output = opts.format === "json"
           ? JSON.stringify(result, null, 2)
-          : result.markdown || ""
+          : result.markdown
 
         if (opts.output && files.length === 1) {
           writeFileSync(opts.output, output, "utf-8")

@@ -1,4 +1,8 @@
 import { defineConfig } from "tsup"
+import { readFileSync } from "fs"
+
+const pkg = JSON.parse(readFileSync("./package.json", "utf-8"))
+const define = { __KORDOC_VERSION__: JSON.stringify(pkg.version) }
 
 export default defineConfig([
   {
@@ -10,6 +14,7 @@ export default defineConfig([
     clean: true,
     external: ["pdfjs-dist"],
     noExternal: ["cfb"],
+    define,
   },
   {
     entry: ["src/cli.ts", "src/mcp.ts"],
@@ -17,5 +22,6 @@ export default defineConfig([
     banner: { js: "#!/usr/bin/env node" },
     external: ["pdfjs-dist"],
     noExternal: ["cfb"],
+    define,
   },
 ])

@@ -2,21 +2,24 @@
 
 import type { CellContext, IRBlock, IRCell, IRTable } from "../types.js"
 
+/** 테이블 열 수 상한 — 한국 공공문서 기준 충분한 값 */
+const MAX_COLS = 200
+
 export function buildTable(rows: CellContext[][]): IRTable {
   const numRows = rows.length
 
   // Pass 1: maxCols 계산
-  const tempOccupied: boolean[][] = Array.from({ length: numRows }, () => Array(100).fill(false))
+  const tempOccupied: boolean[][] = Array.from({ length: numRows }, () => Array(MAX_COLS).fill(false))
   let maxCols = 0
 
   for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
     let colIdx = 0
     for (const cell of rows[rowIdx]) {
-      while (colIdx < 100 && tempOccupied[rowIdx][colIdx]) colIdx++
-      if (colIdx >= 100) break
+      while (colIdx < MAX_COLS && tempOccupied[rowIdx][colIdx]) colIdx++
+      if (colIdx >= MAX_COLS) break
 
       for (let r = rowIdx; r < Math.min(rowIdx + cell.rowSpan, numRows); r++) {
-        for (let c = colIdx; c < Math.min(colIdx + cell.colSpan, 100); c++) {
+        for (let c = colIdx; c < Math.min(colIdx + cell.colSpan, MAX_COLS); c++) {
           tempOccupied[r][c] = true
         }
       }
@@ -150,15 +153,11 @@ function tableToMarkdown(table: IRTable): string {
     }
   }
 
-  // 중복 행 제거
+  // rowSpan에 의해 생긴 빈 placeholder 행만 제거 (내용이 동일한 실제 데이터 행은 유지)
   const uniqueRows: string[][] = []
-  const seen = new Set<string>()
   for (const row of display) {
-    const key = row.join("||")
-    if (!seen.has(key)) {
-      seen.add(key)
-      uniqueRows.push(row)
-    }
+    const isEmptyPlaceholder = row.every(cell => cell === "")
+    if (!isEmptyPlaceholder) uniqueRows.push(row)
   }
 
   if (uniqueRows.length === 0) return ""

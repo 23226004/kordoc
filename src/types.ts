@@ -27,20 +27,28 @@ export interface IRCell {
   rowSpan: number
 }
 
-// ─── 파싱 결과 ──────────────────────────────────────
+// ─── 파싱 결과 (discriminated union) ────────────────
 
 export type FileType = "hwpx" | "hwp" | "pdf" | "unknown"
 
-export interface ParseResult {
-  success: boolean
-  /** 추출된 마크다운 텍스트 */
-  markdown?: string
-  /** 감지된 파일 포맷 */
+interface ParseResultBase {
   fileType: FileType
-  /** 이미지 기반 PDF 여부 (텍스트 추출 불가) */
-  isImageBased?: boolean
   /** PDF 페이지 수 */
   pageCount?: number
-  /** 오류 메시지 */
-  error?: string
+  /** 이미지 기반 PDF 여부 (텍스트 추출 불가) */
+  isImageBased?: boolean
 }
+
+export interface ParseSuccess extends ParseResultBase {
+  success: true
+  /** 추출된 마크다운 텍스트 */
+  markdown: string
+}
+
+export interface ParseFailure extends ParseResultBase {
+  success: false
+  /** 오류 메시지 */
+  error: string
+}
+
+export type ParseResult = ParseSuccess | ParseFailure

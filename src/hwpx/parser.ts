@@ -5,11 +5,10 @@
  */
 
 import JSZip from "jszip"
+import { inflateRawSync } from "zlib"
 import { DOMParser } from "@xmldom/xmldom"
 import { buildTable, convertTableToText, blocksToMarkdown } from "../table/builder.js"
 import type { CellContext, IRBlock } from "../types.js"
-
-/* eslint-disable @typescript-eslint/no-explicit-any */
 
 interface TableState { rows: CellContext[][]; currentRow: CellContext[]; cell: CellContext | null }
 
@@ -66,8 +65,6 @@ function extractFromBrokenZip(buffer: ArrayBuffer): string {
       if (method === 0) {
         content = new TextDecoder().decode(fileData)
       } else if (method === 8) {
-        // raw deflate
-        const { inflateRawSync } = require("zlib")
         content = new TextDecoder().decode(inflateRawSync(Buffer.from(fileData)))
       } else {
         continue
@@ -146,14 +143,14 @@ function parseSectionXml(xml: string): IRBlock[] {
 }
 
 function walkSection(
-  node: any, blocks: IRBlock[],
+  node: Node, blocks: IRBlock[],
   tableCtx: TableState | null, tableStack: TableState[]
 ): void {
   const children = node.childNodes
   if (!children) return
 
   for (let i = 0; i < children.length; i++) {
-    const el = children[i]
+    const el = children[i] as Element
     if (el.nodeType !== 1) continue
 
     const tag = el.tagName || el.localName || ""
@@ -232,13 +229,13 @@ function walkSection(
   }
 }
 
-function extractParagraphText(para: any): string {
+function extractParagraphText(para: Node): string {
   let text = ""
-  const walk = (node: any) => {
+  const walk = (node: Node) => {
     const children = node.childNodes
     if (!children) return
     for (let i = 0; i < children.length; i++) {
-      const child = children[i]
+      const child = children[i] as Element
       if (child.nodeType === 3) { text += child.textContent || ""; continue }
       if (child.nodeType !== 1) continue
 

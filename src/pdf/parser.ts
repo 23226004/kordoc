@@ -6,19 +6,43 @@ import { createRequire } from "module"
 import { pathToFileURL } from "url"
 
 // pdfjs-dist는 external로 빌드됨 — 설치 안 되어 있으면 런타임에 잡힘
-let pdfjsModule: any = null
+interface PdfjsModule {
+  getDocument: (opts: Record<string, unknown>) => { promise: Promise<PdfjsDocument> }
+  GlobalWorkerOptions: { workerSrc: string }
+}
+interface PdfjsDocument {
+  numPages: number
+  getPage: (n: number) => Promise<PdfjsPage>
+}
+interface PdfjsPage {
+  getTextContent: () => Promise<{ items: PdfjsTextItem[] }>
+}
+interface PdfjsTextItem {
+  str: string
+  transform: number[]
+  width: number
+  height: number
+}
 
-async function loadPdfjs() {
+let pdfjsModule: PdfjsModule | null = null
+
+async function loadPdfjs(): Promise<PdfjsModule | null> {
   if (pdfjsModule) return pdfjsModule
   try {
-    pdfjsModule = await import("pdfjs-dist/legacy/build/pdf.mjs")
+    const mod = await import("pdfjs-dist/legacy/build/pdf.mjs") as unknown as PdfjsModule
     // 워커 경로를 file:// URL로 설정 (Node.js ESM 환경 필수)
     const req = createRequire(import.meta.url)
     const workerPath = req.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs")
-    pdfjsModule.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href
-    return pdfjsModule
-  } catch {
-    return null
+    mod.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href
+    pdfjsModule = mod
+    return mod
+  } catch (err) {
+    // import 실패 원인을 구분하여 반환
+    const msg = err instanceof Error ? err.message : String(err)
+    if (msg.includes("Cannot find") || msg.includes("MODULE_NOT_FOUND")) {
+      return null // 미설치
+    }
+    throw new Error(`pdfjs-dist 로딩 실패: ${msg}`)
   }
 }
 
@@ -33,76 +57,62 @@ export async function parsePdfDocument(buffer: ArrayBuffer): Promise<ParseResult
     }
   }
 
-  try {
-    const data = new Uint8Array(buffer)
-    const doc = await pdfjs.getDocument({
-      data,
-      useSystemFonts: true,
-      disableFontFace: true,
-      isEvalSupported: false,
-      workerSrc: "",
-    }).promise
+  const data = new Uint8Array(buffer)
+  const doc = await pdfjs.getDocument({
+    data,
+    useSystemFonts: true,
+    disableFontFace: true,
+    isEvalSupported: false,
+  }).promise
 
-    const pageCount = doc.numPages
-    if (pageCount === 0) {
-      return { success: false, fileType: "pdf", pageCount: 0, error: "PDF에 페이지가 없습니다." }
-    }
+  const pageCount = doc.numPages
+  if (pageCount === 0) {
+    return { success: false, fileType: "pdf", pageCount: 0, error: "PDF에 페이지가 없습니다." }
+  }
 
-    const pageTexts: string[] = []
-    let totalChars = 0
+  const pageTexts: string[] = []
+  let totalChars = 0
 
-    for (let i = 1; i <= pageCount; i++) {
-      const page = await doc.getPage(i)
-      const textContent = await page.getTextContent()
-      const lines = groupTextItemsByLine(textContent.items)
-      const pageText = lines.join("\n")
-      totalChars += pageText.replace(/\s/g, "").length
-      pageTexts.push(pageText)
-    }
+  for (let i = 1; i <= pageCount; i++) {
+    const page = await doc.getPage(i)
+    const textContent = await page.getTextContent()
+    const lines = groupTextItemsByLine(textContent.items)
+    const pageText = lines.join("\n")
+    totalChars += pageText.replace(/\s/g, "").length
+    pageTexts.push(pageText)
+  }
 
-    const avgCharsPerPage = totalChars / pageCount
-    if (avgCharsPerPage < 10) {
-      return {
-        success: false,
-        fileType: "pdf",
-        pageCount,
-        isImageBased: true,
-        error: `이미지 기반 PDF로 추정됩니다 (${pageCount}페이지, 추출 텍스트 ${totalChars}자).`,
-      }
-    }
-
-    let markdown = ""
-    for (let i = 0; i < pageTexts.length; i++) {
-      const cleaned = cleanPdfText(pageTexts[i])
-      if (cleaned.trim()) {
-        if (i > 0 && markdown) markdown += "\n\n"
-        markdown += cleaned
-      }
-    }
-
-    markdown = reconstructTables(markdown)
-
-    return { success: true, fileType: "pdf", markdown, pageCount, isImageBased: false }
-  } catch (err) {
+  const avgCharsPerPage = totalChars / pageCount
+  if (avgCharsPerPage < 10) {
     return {
       success: false,
       fileType: "pdf",
-      pageCount: 0,
-      error: err instanceof Error ? err.message : "PDF 파싱 실패",
+      pageCount,
+      isImageBased: true,
+      error: `이미지 기반 PDF로 추정됩니다 (${pageCount}페이지, 추출 텍스트 ${totalChars}자).`,
     }
   }
+
+  let markdown = ""
+  for (let i = 0; i < pageTexts.length; i++) {
+    const cleaned = cleanPdfText(pageTexts[i])
+    if (cleaned.trim()) {
+      if (i > 0 && markdown) markdown += "\n\n"
+      markdown += cleaned
+    }
+  }
+
+  markdown = reconstructTables(markdown)
+
+  return { success: true, fileType: "pdf", markdown, pageCount, isImageBased: false }
 }
 
 // ─── 텍스트 아이템 → 행 그룹핑 ──────────────────────
 
-interface TextItem { str: string; transform: number[]; width: number; height: number }
-
-function groupTextItemsByLine(items: any[]): string[] {
+function groupTextItemsByLine(items: PdfjsTextItem[]): string[] {
   if (items.length === 0) return []
 
-  const textItems = items.filter((item): item is TextItem =>
-    typeof item.str === "string" && item.str.trim() !== ""
-  )
+  const textItems = items.filter(item => typeof item.str === "string" && item.str.trim() !== "")
   if (textItems.length === 0) return []
 
   textItems.sort((a, b) => {
@@ -145,7 +155,7 @@ function mergeLineItems(items: { text: string; x: number; width: number }[]): st
   return result
 }
 
-function cleanPdfText(text: string): string {
+export function cleanPdfText(text: string): string {
   return text
     .replace(/^[\s]*[-–—]\s*\d+\s*[-–—][\s]*$/gm, "")
     .replace(/^\s*\d+\s*\/\s*\d+\s*$/gm, "")
@@ -178,7 +188,12 @@ function reconstructTables(text: string): string {
 
 function formatAsMarkdownTable(rows: string[][]): string {
   const maxCols = Math.max(...rows.map(r => r.length))
-  const normalized = rows.map(r => { while (r.length < maxCols) r.push(""); return r })
+  // defensive copy — 원본 배열 변경 방지
+  const normalized = rows.map(r => {
+    const copy = [...r]
+    while (copy.length < maxCols) copy.push("")
+    return copy
+  })
 
   const lines: string[] = []
   lines.push("| " + normalized[0].join(" | ") + " |")

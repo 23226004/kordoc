@@ -1,20 +1,25 @@
-/**
- * kordoc MCP 서버 — Claude/Cursor에서 문서 파싱 도구로 사용
- *
- * 사용법:
- *   node dist/mcp.js              (stdio 모드)
- *   node dist/mcp.js --http 3000  (HTTP 모드)
- */
+/** kordoc MCP 서버 — Claude/Cursor에서 문서 파싱 도구로 사용 */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
-import { readFileSync } from "fs"
+import { readFileSync, realpathSync } from "fs"
+import { resolve, isAbsolute } from "path"
 import { parse, detectFormat } from "./index.js"
+import { VERSION, toArrayBuffer } from "./utils.js"
+
+/** 경로 정규화 및 기본 검증 */
+function safePath(filePath: string): string {
+  const resolved = resolve(filePath)
+  // 심볼릭 링크 해석하여 실제 경로 확인
+  const real = realpathSync(resolved)
+  if (!isAbsolute(real)) throw new Error("절대 경로만 허용됩니다")
+  return real
+}
 
 const server = new McpServer({
   name: "kordoc",
-  version: "0.1.0",
+  version: VERSION,
 })
 
 // ─── 도구: parse_document ────────────────────────────
@@ -27,8 +32,9 @@ server.tool(
   },
   async ({ file_path }) => {
     try {
-      const buffer = readFileSync(file_path)
-      const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+      const resolved = safePath(file_path)
+      const buffer = readFileSync(resolved)
+      const arrayBuffer = toArrayBuffer(buffer)
       const format = detectFormat(arrayBuffer)
 
       if (format === "unknown") {
@@ -75,8 +81,9 @@ server.tool(
   },
   async ({ file_path }) => {
     try {
-      const buffer = readFileSync(file_path, { flag: "r" })
-      const header = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + Math.min(buffer.byteLength, 16))
+      const resolved = safePath(file_path)
+      const buffer = readFileSync(resolved, { flag: "r" })
+      const header = toArrayBuffer(buffer.subarray(0, 16))
       const format = detectFormat(header)
       return {
         content: [{ type: "text", text: `${file_path}: ${format}` }],

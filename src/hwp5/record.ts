@@ -11,6 +11,7 @@ export const TAG_LIST_HEADER = 0x0048
 export const TAG_TABLE = 0x004d
 
 // 특수 문자 코드 (UTF-16LE)
+// HWP 스펙에서 0x0000은 NUL이 아닌 줄바꿈(line break)으로 정의됨
 const CHAR_LINE = 0x0000
 const CHAR_PARA = 0x000d
 const CHAR_TAB = 0x0009

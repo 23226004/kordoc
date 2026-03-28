@@ -11,7 +11,14 @@ import type { CellContext, IRBlock } from "../types.js"
 
 import { createRequire } from "module"
 const require = createRequire(import.meta.url)
-const CFB = require("cfb")
+const CFB: CfbModule = require("cfb")
+
+interface CfbEntry { name?: string; content?: Buffer | Uint8Array }
+interface CfbContainer { FileIndex?: CfbEntry[] }
+interface CfbModule {
+  parse(data: Buffer): CfbContainer
+  find(cfb: CfbContainer, path: string): CfbEntry | null
+}
 
 export function parseHwp5Document(buffer: Buffer): string {
   const cfb = CFB.parse(buffer)
@@ -37,8 +44,7 @@ export function parseHwp5Document(buffer: Buffer): string {
   return blocksToMarkdown(blocks)
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function findSections(cfb: any): Buffer[] {
+function findSections(cfb: CfbContainer): Buffer[] {
   const sections: Array<{ idx: number; content: Buffer }> = []
 
   for (let i = 0; ; i++) {
@@ -152,23 +158,36 @@ function parseTableBlock(records: HwpRecord[], startIdx: number) {
 }
 
 function parseCellBlock(records: HwpRecord[], startIdx: number, tableLevel: number) {
-  const cellLevel = records[startIdx].level
+  const rec = records[startIdx]
+  const cellLevel = rec.level
   const texts: string[] = []
+
+  // LIST_HEADER에서 셀 병합 정보 추출
+  // HWP5 셀 LIST_HEADER 구조: paraCount(u16) + flags(u32) + colAddr(u16) + rowAddr(u16) + colSpan(u16) + rowSpan(u16)
+  let colSpan = 1
+  let rowSpan = 1
+  if (rec.data.length >= 14) {
+    const cs = rec.data.readUInt16LE(10)
+    const rs = rec.data.readUInt16LE(12)
+    if (cs > 0) colSpan = cs
+    if (rs > 0) rowSpan = rs
+  }
+
   let i = startIdx + 1
 
   while (i < records.length) {
-    const rec = records[i]
-    if (rec.tagId === TAG_LIST_HEADER && rec.level <= cellLevel) break
-    if (rec.level <= tableLevel && (rec.tagId === TAG_PARA_HEADER || rec.tagId === TAG_CTRL_HEADER)) break
+    const r = records[i]
+    if (r.tagId === TAG_LIST_HEADER && r.level <= cellLevel) break
+    if (r.level <= tableLevel && (r.tagId === TAG_PARA_HEADER || r.tagId === TAG_CTRL_HEADER)) break
 
-    if (rec.tagId === TAG_PARA_TEXT) {
-      const t = extractText(rec.data).trim()
+    if (r.tagId === TAG_PARA_TEXT) {
+      const t = extractText(r.data).trim()
       if (t) texts.push(t)
     }
     i++
   }
 
-  return { cell: { text: texts.join("\n"), colSpan: 1, rowSpan: 1 } as CellContext, nextIdx: i }
+  return { cell: { text: texts.join("\n"), colSpan, rowSpan } as CellContext, nextIdx: i }
 }
 
 function arrangeCells(rows: number, cols: number, cells: CellContext[]): CellContext[][] {

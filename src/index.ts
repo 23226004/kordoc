@@ -61,11 +61,16 @@ export async function parseHwp(buffer: ArrayBuffer): Promise<ParseResult> {
 
 /** PDF 파일에서 텍스트를 추출하여 Markdown으로 변환 */
 export async function parsePdf(buffer: ArrayBuffer): Promise<ParseResult> {
-  return parsePdfDocument(buffer)
+  try {
+    return await parsePdfDocument(buffer)
+  } catch (err) {
+    return { success: false, fileType: "pdf", error: err instanceof Error ? err.message : "PDF 파싱 실패" }
+  }
 }
 
 // ─── Re-exports ──────────────────────────────────────
 
 export { detectFormat, isHwpxFile, isOldHwpFile, isPdfFile } from "./detect.js"
-export type { ParseResult, FileType, IRBlock, IRTable, IRCell, CellContext } from "./types.js"
+export type { ParseResult, ParseSuccess, ParseFailure, FileType, IRBlock, IRTable, IRCell, CellContext } from "./types.js"
 export { buildTable, blocksToMarkdown, convertTableToText } from "./table/builder.js"
+export { VERSION } from "./utils.js"
