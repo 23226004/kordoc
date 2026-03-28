@@ -9,6 +9,7 @@ import { inflateRawSync } from "zlib"
 import { DOMParser } from "@xmldom/xmldom"
 import { buildTable, convertTableToText, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
 import type { CellContext, IRBlock } from "../types.js"
+import { KordocError, isPathTraversal } from "../utils.js"
 
 /** 압축 해제 최대 크기 (100MB) — ZIP bomb 방지 */
 const MAX_DECOMPRESS_SIZE = 100 * 1024 * 1024
@@ -28,22 +29,25 @@ function stripDtd(xml: string): string {
 }
 
 export async function parseHwpxDocument(buffer: ArrayBuffer): Promise<string> {
+  // loadAsync 전 사전 검증 — Central Directory에서 선언된 비압축 크기 합산
+  const precheck = precheckZipSize(buffer)
+  if (precheck.totalUncompressed > MAX_DECOMPRESS_SIZE) {
+    throw new KordocError("ZIP 비압축 크기 초과 (ZIP bomb 의심)")
+  }
+  if (precheck.entryCount > MAX_ZIP_ENTRIES) {
+    throw new KordocError("ZIP 엔트리 수 초과 (ZIP bomb 의심)")
+  }
+
   let zip: JSZip
 
   try {
     zip = await JSZip.loadAsync(buffer)
   } catch {
-    // ZIP Central Directory 손상 — Local File Header 스캔으로 폴백
     return extractFromBrokenZip(buffer)
   }
 
-  // ZIP 전체 엔트리 수 검증 — 비정상 파일에 의한 자원 낭비 방지
-  let entryCount = 0
-  zip.forEach(() => { entryCount++ })
-  if (entryCount > MAX_ZIP_ENTRIES) throw new Error("ZIP 엔트리 수 초과 (ZIP bomb 의심)")
-
   const sectionPaths = await resolveSectionPaths(zip)
-  if (sectionPaths.length === 0) throw new Error("HWPX에서 섹션 파일을 찾을 수 없습니다")
+  if (sectionPaths.length === 0) throw new KordocError("HWPX에서 섹션 파일을 찾을 수 없습니다")
 
   let totalDecompressed = 0
   const blocks: IRBlock[] = []
@@ -51,11 +55,51 @@ export async function parseHwpxDocument(buffer: ArrayBuffer): Promise<string> {
     const file = zip.file(path)
     if (!file) continue
     const xml = await file.async("text")
-    totalDecompressed += xml.length * 2 // UTF-16 추정
-    if (totalDecompressed > MAX_DECOMPRESS_SIZE) throw new Error("ZIP 압축 해제 크기 초과 (ZIP bomb 의심)")
+    totalDecompressed += xml.length * 2
+    if (totalDecompressed > MAX_DECOMPRESS_SIZE) throw new KordocError("ZIP 압축 해제 크기 초과 (ZIP bomb 의심)")
     blocks.push(...parseSectionXml(xml))
   }
   return blocksToMarkdown(blocks)
+}
+
+/**
+ * loadAsync 전 raw buffer에서 Central Directory를 파싱하여
+ * 선언된 비압축 크기 합산 + 엔트리 수를 사전 검증.
+ * Central Directory가 손상된 경우(extractFromBrokenZip으로 폴백될 케이스)에는
+ * 안전한 기본값을 반환하여 loadAsync가 시도되도록 함.
+ */
+function precheckZipSize(buffer: ArrayBuffer): { totalUncompressed: number; entryCount: number } {
+  const data = new DataView(buffer)
+  const len = buffer.byteLength
+
+  // End of Central Directory (EOCD) 시그니처를 뒤에서부터 탐색
+  // EOCD는 최소 22바이트, comment 최대 65535바이트
+  const searchStart = Math.max(0, len - 22 - 65535)
+  let eocdOffset = -1
+  for (let i = len - 22; i >= searchStart; i--) {
+    if (data.getUint32(i, true) === 0x06054b50) { eocdOffset = i; break }
+  }
+  if (eocdOffset < 0) return { totalUncompressed: 0, entryCount: 0 } // 손상 — 폴백 허용
+
+  const entryCount = data.getUint16(eocdOffset + 10, true)
+  const cdSize = data.getUint32(eocdOffset + 12, true)
+  const cdOffset = data.getUint32(eocdOffset + 16, true)
+
+  if (cdOffset + cdSize > len) return { totalUncompressed: 0, entryCount }
+
+  // Central Directory 엔트리 순회
+  let totalUncompressed = 0
+  let pos = cdOffset
+  for (let i = 0; i < entryCount && pos + 46 <= cdOffset + cdSize; i++) {
+    if (data.getUint32(pos, true) !== 0x02014b50) break // CD 시그니처
+    totalUncompressed += data.getUint32(pos + 24, true) // uncompressed size
+    const nameLen = data.getUint16(pos + 28, true)
+    const extraLen = data.getUint16(pos + 30, true)
+    const commentLen = data.getUint16(pos + 32, true)
+    pos += 46 + nameLen + extraLen + commentLen
+  }
+
+  return { totalUncompressed, entryCount }
 }
 
 // ─── 손상 ZIP 복구 (edu-facility-ai에서 포팅) ──────────
@@ -91,8 +135,7 @@ function extractFromBrokenZip(buffer: ArrayBuffer): string {
     const name = new TextDecoder().decode(nameBytes)
 
     // 경로 순회 방지 — 상위 디렉토리 참조 및 절대 경로 차단
-    const normalizedName = name.replace(/\\/g, "/")
-    if (normalizedName.includes("..") || normalizedName.startsWith("/") || /^[A-Za-z]:/.test(normalizedName)) { pos = fileStart + compSize; continue }
+    if (isPathTraversal(name)) { pos = fileStart + compSize; continue }
     const fileData = data.slice(fileStart, fileStart + compSize)
     pos = fileStart + compSize
 
@@ -109,7 +152,7 @@ function extractFromBrokenZip(buffer: ArrayBuffer): string {
         continue
       }
       totalDecompressed += content.length * 2
-      if (totalDecompressed > MAX_DECOMPRESS_SIZE) throw new Error("압축 해제 크기 초과")
+      if (totalDecompressed > MAX_DECOMPRESS_SIZE) throw new KordocError("압축 해제 크기 초과")
       const sectionText = blocksToMarkdown(parseSectionXml(content))
       if (sectionText) texts.push(sectionText)
     } catch {
@@ -117,7 +160,7 @@ function extractFromBrokenZip(buffer: ArrayBuffer): string {
     }
   }
 
-  if (texts.length === 0) throw new Error("손상된 HWPX에서 섹션 데이터를 복구할 수 없습니다")
+  if (texts.length === 0) throw new KordocError("손상된 HWPX에서 섹션 데이터를 복구할 수 없습니다")
   return texts.join("\n\n")
 }
 

@@ -8,6 +8,7 @@ import {
 } from "./record.js"
 import { buildTable, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
 import type { CellContext, IRBlock } from "../types.js"
+import { KordocError } from "../utils.js"
 
 import { createRequire } from "module"
 const require = createRequire(import.meta.url)
@@ -29,22 +30,22 @@ export function parseHwp5Document(buffer: Buffer): string {
   const cfb = CFB.parse(buffer)
 
   const headerEntry = CFB.find(cfb, "/FileHeader")
-  if (!headerEntry?.content) throw new Error("FileHeader 스트림 없음")
+  if (!headerEntry?.content) throw new KordocError("FileHeader 스트림 없음")
   const header = parseFileHeader(Buffer.from(headerEntry.content))
-  if (header.signature !== "HWP Document File") throw new Error("HWP 시그니처 불일치")
-  if (header.flags & FLAG_ENCRYPTED) throw new Error("암호화된 HWP는 지원하지 않습니다")
-  if (header.flags & FLAG_DRM) throw new Error("DRM 보호된 HWP는 지원하지 않습니다")
+  if (header.signature !== "HWP Document File") throw new KordocError("HWP 시그니처 불일치")
+  if (header.flags & FLAG_ENCRYPTED) throw new KordocError("암호화된 HWP는 지원하지 않습니다")
+  if (header.flags & FLAG_DRM) throw new KordocError("DRM 보호된 HWP는 지원하지 않습니다")
   const compressed = (header.flags & FLAG_COMPRESSED) !== 0
 
   const sections = findSections(cfb)
-  if (sections.length === 0) throw new Error("섹션 스트림을 찾을 수 없습니다")
+  if (sections.length === 0) throw new KordocError("섹션 스트림을 찾을 수 없습니다")
 
   const blocks: IRBlock[] = []
   let totalDecompressed = 0
   for (const sectionData of sections) {
     const data = compressed ? decompressStream(Buffer.from(sectionData)) : Buffer.from(sectionData)
     totalDecompressed += data.length
-    if (totalDecompressed > MAX_TOTAL_DECOMPRESS) throw new Error("총 압축 해제 크기 초과 (decompression bomb 의심)")
+    if (totalDecompressed > MAX_TOTAL_DECOMPRESS) throw new KordocError("총 압축 해제 크기 초과 (decompression bomb 의심)")
     const records = readRecords(data)
     blocks.push(...parseSection(records))
   }

@@ -1,6 +1,7 @@
 /** PDF 텍스트 추출 (pdfjs-dist 기반 서버사이드 파싱) */
 
 import type { ParseResult } from "../types.js"
+import { KordocError } from "../utils.js"
 
 /** 최대 처리 페이지 수 — OOM 방지 */
 const MAX_PAGES = 5000
@@ -48,7 +49,7 @@ async function loadPdfjs(): Promise<PdfjsModule | null> {
     if (msg.includes("Cannot find") || msg.includes("MODULE_NOT_FOUND")) {
       return null // 미설치
     }
-    throw new Error(`pdfjs-dist 로딩 실패: ${msg}`)
+    throw new KordocError(`pdfjs-dist 로딩 실패: ${msg}`)
   }
 }
 
@@ -89,7 +90,7 @@ export async function parsePdfDocument(buffer: ArrayBuffer): Promise<ParseResult
       const pageText = lines.join("\n")
       totalChars += pageText.replace(/\s/g, "").length
       totalTextBytes += pageText.length * 2
-      if (totalTextBytes > MAX_TOTAL_TEXT) throw new Error(`텍스트 추출 크기 초과 (${MAX_TOTAL_TEXT / 1024 / 1024}MB 제한)`)
+      if (totalTextBytes > MAX_TOTAL_TEXT) throw new KordocError(`텍스트 추출 크기 초과 (${MAX_TOTAL_TEXT / 1024 / 1024}MB 제한)`)
       pageTexts.push(pageText)
     }
 

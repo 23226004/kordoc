@@ -1,6 +1,7 @@
 /** HWP 5.x 레코드 리더, UTF-16LE 텍스트 추출, 스트림 압축해제 */
 
 import { inflateRawSync, inflateSync } from "zlib"
+import { KordocError } from "../utils.js"
 
 // ─── 레코드 태그 상수 ────────────────────────────────
 
@@ -87,7 +88,7 @@ export function decompressStream(data: Buffer): Buffer {
 // ─── FileHeader 파싱 ─────────────────────────────────
 
 export function parseFileHeader(data: Buffer): HwpFileHeader {
-  if (data.length < 40) throw new Error("FileHeader가 너무 짧습니다 (최소 40바이트)")
+  if (data.length < 40) throw new KordocError("FileHeader가 너무 짧습니다 (최소 40바이트)")
   const sig = data.subarray(0, 32).toString("utf8").replace(/\0+$/, "")
   return {
     signature: sig,

@@ -5,11 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-03-28
+
+### Changed
+- **KordocError 클래스 도입** — 모든 파서가 `KordocError`를 throw, MCP `sanitizeError`가 `instanceof`로 판별. 문자열 패턴 매칭 제거
+- **JSZip ZIP bomb 사전 검증** — `loadAsync` 전 raw buffer에서 Central Directory를 직접 파싱하여 선언된 비압축 크기 합산 검증
+- **toArrayBuffer 최적화** — offset=0이고 전체 ArrayBuffer를 차지하면 복사 없이 직접 반환
+- **sanitizeError, isPathTraversal을 utils.ts로 이동** — 테스트가 실제 코드를 직접 import하여 검증
+
+### Fixed
+- cfb 버전을 정확히 핀 (`^1.2.2` → `1.2.2`), 번들링 일관성 확보
+- `@types/node` `^25` → `^18`로 다운그레이드, engines `>=18`과 일치
+- CHANGELOG 날짜를 git log 실제 커밋 날짜 기준으로 정정
+- SECURITY.md Response Timeline을 개인 프로젝트 현실에 맞게 완화
+- MAX_RECORDS 테스트에 잘림 이후 데이터 정합성 검증 추가
+
 ## [1.0.1] - 2026-03-28
 
 ### Fixed
 - JSZip 검증에서 undocumented internal API(`_data.uncompressedSize`) 의존 제거, 엔트리 수 기반 검증으로 교체
-- MCP 에러 정제를 regex 기반에서 allowlist 기반으로 교체 — 모든 경로 패턴(UNC, `/opt/`, `/data/` 등) 누락 없이 차단
+- MCP 에러 정제를 regex 기반에서 allowlist 기반으로 교체
 
 ### Added
 - 보안 로직 회귀 테스트 9개 추가 (MAX_RECORDS, span 방어, 제어문자 코드 10, 경로 순회, 에러 정제)
@@ -23,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - PDF: MAX_PAGES(5,000) + 누적 텍스트 크기 100MB 제한으로 OOM 방지
-- HWP5: 바이너리에서 읽은 rows/cols를 MAX_ROWS/MAX_COLS로 클램핑 (4.3B 셀 할당 공격 차단)
+- HWP5: 바이너리에서 읽은 rows/cols를 MAX_ROWS/MAX_COLS로 클램핑
 - HWP5: readRecords MAX_RECORDS(500K) 제한으로 메모리 폭주 방지
 - HWP5: findSections fallback 경로에도 MAX_SECTIONS(100) 적용
 - HWPX: manifest 경로 검색을 Regex에서 문자열 비교로 교체 (ReDoS 벡터 제거)
@@ -33,39 +48,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - tsup: CLI/MCP 빌드에 sourcemap 추가
 
 ### Fixed
-- HWP5: 제어문자 코드 10(각주/미주)을 isExt 범위에 포함 — 각주 포함 문서 파싱 정확도 수정
+- HWP5: 제어문자 코드 10(각주/미주)을 isExt 범위에 포함
 
-## [0.2.2] - 2026-03-27
-
-### Security
-- colSpan/rowSpan 클램핑 — 악성 병합 값을 그리드 한계로 클램핑
-- MCP 서버 safePath 강화 — symlink 해석, 확장자 검증
-- 파일 크기 제한 (500MB) 추가
-
-## [0.2.1] - 2026-03-27
+## [0.2.2] - 2026-03-28
 
 ### Security
-- ZIP bomb 방지 — 100MB 압축 해제 제한, 500 엔트리 제한
-- XXE/Billion Laughs 방지 — DOCTYPE 완전 제거
-- HWP5 압축 폭탄 방지 — maxOutputLength + 누적 100MB 제한
-- 손상 ZIP 경로 순회 차단
-- PDF 리소스 정리 (doc.destroy)
-- HWP5 섹션 수 제한 (100)
+- colSpan/rowSpan 클램핑, MCP safePath 강화, 파일 크기 제한
+
+## [0.2.1] - 2026-03-28
+
+### Security
+- ZIP bomb 방지, XXE/Billion Laughs 방지, HWP5 압축 폭탄 방지, 경로 순회 차단
 
 ### Changed
 - pdfjs-dist를 선택적 peerDependency로 변경
 
-## [0.2.0] - 2026-03-26
+## [0.2.0] - 2026-03-28
 
 ### Changed
-- 전면 리팩토링: IR(Intermediate Representation) 패턴 도입
-- 2-pass 테이블 빌더 구현
-- 파서-렌더러 분리 아키텍처
+- IR 패턴 도입, 2-pass 테이블 빌더, 파서-렌더러 분리
 
-## [0.1.0] - 2026-03-25
+## [0.1.0] - 2026-03-28
 
 ### Added
-- 최초 릴리스
-- HWP 5.x, HWPX, PDF 파싱 지원
-- CLI 도구 (kordoc)
-- MCP 서버 (kordoc-mcp)
+- 최초 릴리스: HWP 5.x, HWPX, PDF 파싱, CLI, MCP 서버

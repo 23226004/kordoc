@@ -6,7 +6,7 @@ import { z } from "zod"
 import { readFileSync, realpathSync, openSync, readSync, closeSync, statSync } from "fs"
 import { resolve, isAbsolute, extname } from "path"
 import { parse, detectFormat } from "./index.js"
-import { VERSION, toArrayBuffer } from "./utils.js"
+import { VERSION, toArrayBuffer, sanitizeError, KordocError } from "./utils.js"
 
 /** 허용 파일 확장자 */
 const ALLOWED_EXTENSIONS = new Set([".hwp", ".hwpx", ".pdf"])
@@ -15,12 +15,12 @@ const MAX_FILE_SIZE = 500 * 1024 * 1024
 
 /** 경로 정규화 및 보안 검증 */
 function safePath(filePath: string): string {
-  if (!filePath) throw new Error("파일 경로가 비어있습니다")
+  if (!filePath) throw new KordocError("파일 경로가 비어있습니다")
   const resolved = resolve(filePath)
   const real = realpathSync(resolved)
-  if (!isAbsolute(real)) throw new Error("절대 경로만 허용됩니다")
+  if (!isAbsolute(real)) throw new KordocError("절대 경로만 허용됩니다")
   const ext = extname(real).toLowerCase()
-  if (!ALLOWED_EXTENSIONS.has(ext)) throw new Error(`지원하지 않는 확장자입니다: ${ext} (허용: ${[...ALLOWED_EXTENSIONS].join(", ")})`)
+  if (!ALLOWED_EXTENSIONS.has(ext)) throw new KordocError(`지원하지 않는 확장자입니다: ${ext} (허용: ${[...ALLOWED_EXTENSIONS].join(", ")})`)
   return real
 }
 
@@ -118,20 +118,6 @@ server.tool(
     }
   }
 )
-
-// ─── 에러 메시지 정제 — 파일시스템 경로 노출 방지 ─────
-
-/** 알려진 kordoc 에러 메시지 패턴 — 이 패턴에 해당하면 원본 메시지를 그대로 반환 */
-const SAFE_ERROR_PATTERNS = [
-  /^(빈 버퍼|지원하지 않는|파싱 실패|암호화된|DRM 보호|FileHeader|HWP 시그니처|HWPX에서|섹션 스트림|ZIP|pdfjs-dist|PDF에|텍스��� 추출|이미지 기반|총 압축)/,
-  /^(파일 경로가|절대 경로만|확장자)/,
-]
-
-function sanitizeError(err: unknown): string {
-  const msg = err instanceof Error ? err.message : String(err)
-  if (SAFE_ERROR_PATTERNS.some(p => p.test(msg))) return msg
-  return "문서 처리 중 오류가 발생했습니다"
-}
 
 // ─── 서버 시작 ───────────────────────────────────────
 

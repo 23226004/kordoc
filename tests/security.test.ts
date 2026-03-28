@@ -1,29 +1,33 @@
 /**
- * 보안 로직 테스트 — 방어적 상수 및 입력 검증 검증
+ * 보안 로직 테스트 — 방어적 상수 및 입력 검증
  *
- * 정상 문서에선 트리거되지 않지만, 조작된 입력에 대한 안전장치가
- * 리팩토링 과정에서 조용히 빠지지 않도록 검증하는 회귀 테스트.
+ * 모든 테스트가 실제 소스 코드를 직접 import하여 검증.
+ * 로직 복제 없음 — 소스가 변경되면 테스트도 함께 깨짐.
  */
 
 import { describe, it } from "node:test"
 import assert from "node:assert/strict"
 import { readRecords, extractText } from "../src/hwp5/record.js"
 import { buildTable, MAX_COLS, MAX_ROWS } from "../src/table/builder.js"
+import { KordocError, sanitizeError, isPathTraversal } from "../src/utils.js"
 import type { CellContext } from "../src/types.js"
 
 // ─── readRecords: MAX_RECORDS 제한 ─────────────────────
 
 describe("readRecords — MAX_RECORDS 제한", () => {
-  it("500,000개 초과 레코드는 잘림", () => {
-    // 각 레코드: 4바이트 헤더(tagId=1, level=0, size=0) = 최소 크기
-    // header = 1 | (0 << 10) | (0 << 20) = 0x00000001
+  it("500,000개 초과 레코드는 잘림 + 잘림 전 데이터 정합성", () => {
     const recordCount = 500_001
     const buf = Buffer.alloc(recordCount * 4)
     for (let i = 0; i < recordCount; i++) {
-      buf.writeUInt32LE(0x00000001, i * 4) // tagId=1, level=0, size=0
+      // tagId = i의 하위 10비트, level=0, size=0
+      buf.writeUInt32LE((i & 0x3ff) | (0 << 10) | (0 << 20), i * 4)
     }
     const records = readRecords(buf)
     assert.equal(records.length, 500_000)
+    // 잘림 전 데이터 정합성 — 첫 번째와 마지막 레코드의 tagId 검증
+    assert.equal(records[0].tagId, 0)
+    assert.equal(records[499_999].tagId, 499_999 & 0x3ff)
+    assert.equal(records[499_999].size, 0)
   })
 })
 
@@ -34,14 +38,12 @@ describe("buildTable — 악성 span 값 방어", () => {
     const rows: CellContext[][] = [
       [{ text: "A", colSpan: 9999, rowSpan: 9999 }],
     ]
-    // MAX_ROWS = 10000이지만 실제 행이 1개이므로 안전하게 처리되어야 함
     const table = buildTable(rows)
     assert.equal(table.rows, 1)
     assert.ok(table.cols >= 1)
   })
 
   it("MAX_ROWS 초과 행은 잘림", () => {
-    // 10,001행짜리 테이블 → 10,000행으로 잘려야 함
     const rows: CellContext[][] = Array.from({ length: MAX_ROWS + 1 }, () => [
       { text: "x", colSpan: 1, rowSpan: 1 },
     ])
@@ -54,122 +56,86 @@ describe("buildTable — 악성 span 값 방어", () => {
 
 describe("extractText — 제어문자 코드 10 처리", () => {
   it("코드 10(각주/미주)이 확장 제어문자로 14바이트 스킵됨", () => {
-    // 코드 10 (0x000A) + 14바이트 payload + 'Z'
     const buf = Buffer.alloc(2 + 14 + 2)
-    buf.writeUInt16LE(0x000a, 0) // 각주/미주 제어문자
-    // 14바이트 payload (zeros)
+    buf.writeUInt16LE(0x000a, 0)
     buf.writeUInt16LE("Z".charCodeAt(0), 16)
-    const result = extractText(buf)
-    assert.equal(result, "Z")
+    assert.equal(extractText(buf), "Z")
   })
 
   it("코드 10 뒤에 payload가 부족하면 스킵 안 함 (안전 처리)", () => {
-    // 코드 10 + 4바이트만 (14바이트 부족)
     const buf = Buffer.alloc(6)
     buf.writeUInt16LE(0x000a, 0)
     buf.writeUInt16LE("A".charCodeAt(0), 2)
     buf.writeUInt16LE("B".charCodeAt(0), 4)
-    // payload 부족이므로 스킵 안 됨 → 'A', 'B'는 그대로 출력될 수 있음
     const result = extractText(buf)
-    // 최소한 크래시 없이 반환되어야 함
     assert.equal(typeof result, "string")
   })
 })
 
-// ─── 경로 순회 방어 (HWPX broken ZIP) ─────────────────────
+// ─── isPathTraversal — 실제 utils.ts 함수 직접 테스트 ──────
 
-describe("경로 순회 방어 — 테스트 가능한 로직 검증", () => {
-  it("백슬래시가 포함된 경로는 정규화 후 차단됨", () => {
-    // 실제 extractFromBrokenZip은 private이므로 로직만 단위 검증
-    const testPaths = [
+describe("isPathTraversal — 실제 함수 테스트", () => {
+  it("악성 경로는 true 반환", () => {
+    const malicious = [
       "..\\..\\etc\\passwd",
       "Contents\\..\\..\\secret.xml",
       "C:\\Windows\\system32\\config",
       "/etc/passwd",
       "../../../secret",
     ]
-
-    for (const name of testPaths) {
-      const normalized = name.replace(/\\/g, "/")
-      const isBlocked =
-        normalized.includes("..") ||
-        normalized.startsWith("/") ||
-        /^[A-Za-z]:/.test(normalized)
-      assert.equal(isBlocked, true, `경로 "${name}"이 차단되어야 함`)
+    for (const name of malicious) {
+      assert.equal(isPathTraversal(name), true, `"${name}" → true`)
     }
   })
 
-  it("정상 경로는 통과함", () => {
-    const safePaths = [
+  it("정상 경로는 false 반환", () => {
+    const safe = [
       "Contents/section0.xml",
       "section1.xml",
       "Contents/Sub/section2.xml",
     ]
-
-    for (const name of safePaths) {
-      const normalized = name.replace(/\\/g, "/")
-      const isBlocked =
-        normalized.includes("..") ||
-        normalized.startsWith("/") ||
-        /^[A-Za-z]:/.test(normalized)
-      assert.equal(isBlocked, false, `경로 "${name}"은 허용되어야 함`)
+    for (const name of safe) {
+      assert.equal(isPathTraversal(name), false, `"${name}" → false`)
     }
   })
 })
 
-// ─── MCP 에러 정제 ─────────────────────────────────────
+// ─── sanitizeError — 실제 utils.ts 함수 직접 테스트 ────────
 
-describe("MCP sanitizeError — allowlist 방식 검증", () => {
-  /**
-   * sanitizeError는 mcp.ts 내부 함수이므로 직접 import 불가.
-   * 동일한 로직을 복제하여 단위 테스트.
-   * mcp.ts의 구현이 변경되면 이 테스트도 업데이트해야 함.
-   */
-  const SAFE_ERROR_PATTERNS = [
-    /^(빈 버퍼|지원하지 않는|파싱 실패|암호화된|DRM 보호|FileHeader|HWP 시그니처|HWPX에서|섹션 스트림|ZIP|pdfjs-dist|PDF에|텍스트 추출|이미지 기반|총 압축)/,
-    /^(파일 경로가|절대 경로만|확장자)/,
-  ]
-
-  function sanitizeError(err: unknown): string {
-    const msg = err instanceof Error ? err.message : String(err)
-    if (SAFE_ERROR_PATTERNS.some(p => p.test(msg))) return msg
-    return "문서 처리 중 오류가 발생했습니다"
-  }
-
-  it("kordoc 내부 에러 메시지는 그대로 반환", () => {
-    const safeMessages = [
+describe("sanitizeError — 실제 함수 테스트", () => {
+  it("KordocError는 메시지 그대로 반환", () => {
+    const messages = [
       "빈 버퍼이거나 유효하지 않은 입력입니다.",
       "암호화된 HWP는 지원하지 않습니다",
-      "DRM 보호된 HWP는 지원하지 않습니다",
       "ZIP 압축 해제 크기 초과 (ZIP bomb 의심)",
-      "HWPX에서 섹션 파일을 찾을 수 없습니다",
       "파일 경로가 비어있습니다",
-      "절대 경로만 허용됩니다",
-      "확장자: .docx는 지원하지 않습니다",
-      "pdfjs-dist가 설치되지 않았습니다",
-      "텍스트 추출 크기 초과",
-      "총 압축 해제 크기 초과",
     ]
-
-    for (const msg of safeMessages) {
-      assert.equal(sanitizeError(new Error(msg)), msg, `"${msg}"는 그대로 반환되어야 함`)
+    for (const msg of messages) {
+      assert.equal(sanitizeError(new KordocError(msg)), msg)
     }
   })
 
-  it("알 수 없는 에러 메시지는 일반 메시지로 대체", () => {
-    const unsafeMessages = [
-      "ENOENT: no such file or directory, open 'C:\\Users\\admin\\secret.hwp'",
-      "Cannot read properties of null (reading 'getPage') at /opt/app/node_modules/pdfjs-dist/build/pdf.js:1234",
-      "EACCES: permission denied, open '/home/user/.ssh/id_rsa'",
-      "Error: \\\\server\\share\\documents\\report.hwp",
+  it("일반 Error는 일반 메시지로 대체", () => {
+    const unsafeErrors = [
+      new Error("ENOENT: no such file, open 'C:\\Users\\admin\\secret.hwp'"),
+      new Error("Cannot read properties at /opt/app/node_modules/pdfjs-dist/build/pdf.js:1234"),
+      new Error("EACCES: permission denied, open '/home/user/.ssh/id_rsa'"),
+      "string error with C:\\path\\leak",
     ]
-
-    for (const msg of unsafeMessages) {
-      assert.equal(
-        sanitizeError(new Error(msg)),
-        "문서 처리 중 오류가 발생했습니다",
-        `"${msg}"는 경로 정보가 제거되어야 함`
-      )
+    for (const err of unsafeErrors) {
+      assert.equal(sanitizeError(err), "문서 처리 중 오류가 발생했습니다")
     }
+  })
+})
+
+// ─── KordocError — instanceof 체인 검증 ─────────────────
+
+describe("KordocError", () => {
+  it("Error의 서브클래스이며 name이 KordocError", () => {
+    const err = new KordocError("test")
+    assert.ok(err instanceof Error)
+    assert.ok(err instanceof KordocError)
+    assert.equal(err.name, "KordocError")
+    assert.equal(err.message, "test")
   })
 })

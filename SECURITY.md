@@ -21,9 +21,11 @@ If you discover a security vulnerability in kordoc, please report it responsibly
 
 ### Response Timeline
 
-- **Acknowledgement**: Within 48 hours
-- **Initial assessment**: Within 1 week
-- **Fix release**: Within 2 weeks for critical issues
+This is a solo-maintained project. Timelines are best-effort:
+
+- **Acknowledgement**: Best effort, typically within 1 week
+- **Initial assessment**: Within 2 weeks
+- **Fix release**: Depends on severity and complexity. Critical issues are prioritized but no SLA is guaranteed
 
 ## Security Measures
 
