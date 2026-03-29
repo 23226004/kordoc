@@ -14,7 +14,7 @@
 
 ---
 
-## What's New in v1.4.0
+## What's New in v1.4.1
 
 - **Document Compare** — Diff two documents at IR level. Cross-format (HWP vs HWPX) supported.
 - **Form Field Recognition** — Extract label-value pairs from government forms automatically.
