@@ -8,7 +8,7 @@ import JSZip from "jszip"
 import { inflateRawSync } from "zlib"
 import { DOMParser } from "@xmldom/xmldom"
 import { buildTable, convertTableToText, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
-import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions } from "../types.js"
+import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle } from "../types.js"
 import { KordocError, isPathTraversal } from "../utils.js"
 import { parsePageRange } from "../page-range.js"
 
@@ -23,6 +23,103 @@ function clampSpan(val: number, max: number): number {
 }
 
 interface TableState { rows: CellContext[][]; currentRow: CellContext[]; cell: CellContext | null }
+
+// ─── HWPX 스타일 정보 ──────────────────────────────
+
+interface HwpxCharProperty {
+  fontSize?: number  // 단위: pt (hwpx는 centi-pt → /100)
+  bold?: boolean
+  italic?: boolean
+  fontName?: string
+}
+
+interface HwpxStyleMap {
+  charProperties: Map<string, HwpxCharProperty>  // id → property
+  styles: Map<string, { name: string; charPrId?: string; paraPrId?: string }>  // id → style
+}
+
+/** head.xml 또는 header.xml에서 스타일 정보 추출 */
+async function extractHwpxStyles(zip: JSZip): Promise<HwpxStyleMap> {
+  const result: HwpxStyleMap = {
+    charProperties: new Map(),
+    styles: new Map(),
+  }
+
+  const headerPaths = ["Contents/header.xml", "header.xml", "Contents/head.xml", "head.xml"]
+  for (const hp of headerPaths) {
+    const hpLower = hp.toLowerCase()
+    const file = zip.file(hp) || Object.values(zip.files).find(f => f.name.toLowerCase() === hpLower) || null
+    if (!file) continue
+
+    try {
+      const xml = await file.async("text")
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(stripDtd(xml), "text/xml")
+      if (!doc.documentElement) continue
+
+      // charProperties 파싱
+      parseCharProperties(doc, result.charProperties)
+      // styles 파싱
+      parseStyleElements(doc, result.styles)
+      break
+    } catch { continue }
+  }
+
+  return result
+}
+
+function parseCharProperties(doc: Document, map: Map<string, HwpxCharProperty>): void {
+  // <hh:charPr> 또는 <charPr> 요소 탐색
+  const tagNames = ["hh:charPr", "charPr", "hp:charPr"]
+  for (const tagName of tagNames) {
+    const elements = doc.getElementsByTagName(tagName)
+    for (let i = 0; i < elements.length; i++) {
+      const el = elements[i]
+      const id = el.getAttribute("id") || el.getAttribute("IDRef") || ""
+      if (!id) continue
+
+      const prop: HwpxCharProperty = {}
+
+      // height 속성 (centi-pt 단위)
+      const height = el.getAttribute("height")
+      if (height) prop.fontSize = parseInt(height, 10) / 100
+
+      // bold/italic
+      const bold = el.getAttribute("bold")
+      if (bold === "true" || bold === "1") prop.bold = true
+      const italic = el.getAttribute("italic")
+      if (italic === "true" || italic === "1") prop.italic = true
+
+      // 하위 요소에서 fontface 탐색
+      const fontFaces = el.getElementsByTagName("*")
+      for (let j = 0; j < fontFaces.length; j++) {
+        const ff = fontFaces[j]
+        const localTag = (ff.tagName || "").replace(/^[^:]+:/, "")
+        if (localTag === "fontface" || localTag === "fontRef") {
+          const face = ff.getAttribute("face") || ff.getAttribute("FontFace")
+          if (face) { prop.fontName = face; break }
+        }
+      }
+
+      map.set(id, prop)
+    }
+  }
+}
+
+function parseStyleElements(doc: Document, map: Map<string, { name: string; charPrId?: string; paraPrId?: string }>): void {
+  const tagNames = ["hh:style", "style", "hp:style"]
+  for (const tagName of tagNames) {
+    const elements = doc.getElementsByTagName(tagName)
+    for (let i = 0; i < elements.length; i++) {
+      const el = elements[i]
+      const id = el.getAttribute("id") || el.getAttribute("IDRef") || String(i)
+      const name = el.getAttribute("name") || el.getAttribute("engName") || ""
+      const charPrId = el.getAttribute("charPrIDRef") || undefined
+      const paraPrId = el.getAttribute("paraPrIDRef") || undefined
+      map.set(id, { name, charPrId, paraPrId })
+    }
+  }
+}
 
 /** XXE/Billion Laughs 방지 — DOCTYPE 제거 (내부 DTD 서브셋 포함) */
 function stripDtd(xml: string): string {
@@ -57,6 +154,10 @@ export async function parseHwpxDocument(buffer: ArrayBuffer, options?: ParseOpti
   const metadata: DocumentMetadata = {}
   await extractHwpxMetadata(zip, metadata)
 
+  // 스타일 정보 추출 (best-effort)
+  const styleMap = await extractHwpxStyles(zip)
+  const warnings: ParseWarning[] = []
+
   const sectionPaths = await resolveSectionPaths(zip)
   if (sectionPaths.length === 0) throw new KordocError("HWPX에서 섹션 파일을 찾을 수 없습니다")
 
@@ -74,11 +175,19 @@ export async function parseHwpxDocument(buffer: ArrayBuffer, options?: ParseOpti
     const xml = await file.async("text")
     totalDecompressed += xml.length * 2
     if (totalDecompressed > MAX_DECOMPRESS_SIZE) throw new KordocError("ZIP 압축 해제 크기 초과 (ZIP bomb 의심)")
-    blocks.push(...parseSectionXml(xml))
+    blocks.push(...parseSectionXml(xml, styleMap, warnings, si + 1))
   }
 
+  // 스타일 기반 헤딩 감지
+  detectHwpxHeadings(blocks, styleMap)
+
+  // outline 구축
+  const outline: OutlineItem[] = blocks
+    .filter(b => b.type === "heading" && b.level && b.text)
+    .map(b => ({ level: b.level!, text: b.text!, pageNumber: b.pageNumber }))
+
   const markdown = blocksToMarkdown(blocks)
-  return { markdown, blocks, metadata }
+  return { markdown, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined }
 }
 
 // ─── 메타데이터 추출 (best-effort) ───────────────────
@@ -316,21 +425,66 @@ function parseSectionPathsFromManifest(xml: string): string[] {
     .map(([, href]) => href)
 }
 
+// ─── 헤딩 감지 (스타일 기반) ────────────────────────
+
+/** HWPX 스타일 기반 헤딩 감지 */
+function detectHwpxHeadings(blocks: IRBlock[], styleMap: HwpxStyleMap): void {
+  // 본문 폰트 크기 결정
+  let baseFontSize = 0
+  const sizeFreq = new Map<number, number>()
+  for (const b of blocks) {
+    if (b.style?.fontSize) {
+      sizeFreq.set(b.style.fontSize, (sizeFreq.get(b.style.fontSize) || 0) + 1)
+    }
+  }
+  let maxCount = 0
+  for (const [size, count] of sizeFreq) {
+    if (count > maxCount) { maxCount = count; baseFontSize = size }
+  }
+
+  for (const block of blocks) {
+    if (block.type !== "paragraph" || !block.text) continue
+    const text = block.text.trim()
+    if (text.length === 0 || text.length > 200 || /^\d+$/.test(text)) continue
+
+    let level = 0
+
+    // 폰트 크기 기반
+    if (baseFontSize > 0 && block.style?.fontSize) {
+      const ratio = block.style.fontSize / baseFontSize
+      if (ratio >= 1.5) level = 1
+      else if (ratio >= 1.3) level = 2
+      else if (ratio >= 1.15) level = 3
+    }
+
+    // "제N조/장/절" 패턴
+    if (/^제\d+[조장절편]/.test(text) && text.length <= 50) {
+      if (level === 0) level = 3
+    }
+
+    if (level > 0) {
+      block.type = "heading"
+      block.level = level
+    }
+  }
+}
+
 // ─── 섹션 XML 파싱 ──────────────────────────────────
 
-function parseSectionXml(xml: string): IRBlock[] {
+function parseSectionXml(xml: string, styleMap?: HwpxStyleMap, warnings?: ParseWarning[], sectionNum?: number): IRBlock[] {
   const parser = new DOMParser()
   const doc = parser.parseFromString(stripDtd(xml), "text/xml")
   if (!doc.documentElement) return []
 
   const blocks: IRBlock[] = []
-  walkSection(doc.documentElement, blocks, null, [])
+  walkSection(doc.documentElement, blocks, null, [], styleMap, warnings, sectionNum)
   return blocks
 }
 
 function walkSection(
   node: Node, blocks: IRBlock[],
-  tableCtx: TableState | null, tableStack: TableState[]
+  tableCtx: TableState | null, tableStack: TableState[],
+  styleMap?: HwpxStyleMap, warnings?: ParseWarning[], sectionNum?: number
 ): void {
   const children = node.childNodes
   if (!children) return
@@ -346,7 +500,7 @@ function walkSection(
       case "tbl": {
         if (tableCtx) tableStack.push(tableCtx)
         const newTable: TableState = { rows: [], currentRow: [], cell: null }
-        walkSection(el, blocks, newTable, tableStack)
+        walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum)
 
         if (newTable.rows.length > 0) {
           if (tableStack.length > 0) {
@@ -357,7 +511,7 @@ function walkSection(
             }
             tableCtx = parentTable
           } else {
-            blocks.push({ type: "table", table: buildTable(newTable.rows) })
+            blocks.push({ type: "table", table: buildTable(newTable.rows), pageNumber: sectionNum })
             tableCtx = null
           }
         } else {
@@ -369,7 +523,7 @@ function walkSection(
       case "tr":
         if (tableCtx) {
           tableCtx.currentRow = []
-          walkSection(el, blocks, tableCtx, tableStack)
+          walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
           if (tableCtx.currentRow.length > 0) tableCtx.rows.push(tableCtx.currentRow)
           tableCtx.currentRow = []
         }
@@ -378,7 +532,7 @@ function walkSection(
       case "tc":
         if (tableCtx) {
           tableCtx.cell = { text: "", colSpan: 1, rowSpan: 1 }
-          walkSection(el, blocks, tableCtx, tableStack)
+          walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
           if (tableCtx.cell) {
             tableCtx.currentRow.push(tableCtx.cell)
             tableCtx.cell = null
@@ -396,27 +550,97 @@ function walkSection(
         break
 
       case "p": {
-        const text = extractParagraphText(el)
+        const { text, href, footnote, style } = extractParagraphInfo(el, styleMap)
         if (text) {
           if (tableCtx?.cell) {
             tableCtx.cell.text += (tableCtx.cell.text ? "\n" : "") + text
           } else if (!tableCtx) {
-            blocks.push({ type: "paragraph", text })
+            const block: IRBlock = { type: "paragraph", text, pageNumber: sectionNum }
+            if (style) block.style = style
+            if (href) block.href = href
+            if (footnote) block.footnoteText = footnote
+            blocks.push(block)
           }
         }
-        walkSection(el, blocks, tableCtx, tableStack)
+        // <p> 내부의 <tbl>만 별도 처리 — extractParagraphInfo가 이미 텍스트를 추출했으므로
+        // 전체 walkSection 재귀 대신 테이블/이미지 자식만 선택적으로 처리
+        tableCtx = walkParagraphChildren(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
         break
       }
 
+      // 이미지/그림 — 경고 수집
+      case "pic": case "shape": case "drawingObject":
+        if (warnings && sectionNum) {
+          warnings.push({ page: sectionNum, message: `스킵된 요소: ${localTag}`, code: "SKIPPED_IMAGE" })
+        }
+        break
+
       default:
-        walkSection(el, blocks, tableCtx, tableStack)
+        walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
         break
     }
   }
 }
 
-function extractParagraphText(para: Node): string {
+/** <p> 내부에서 텍스트가 아닌 구조적 자식만 처리 (tbl, pic, shape). tableCtx 반환으로 상태 전파 */
+function walkParagraphChildren(
+  node: Node, blocks: IRBlock[],
+  tableCtx: TableState | null, tableStack: TableState[],
+  styleMap?: HwpxStyleMap, warnings?: ParseWarning[], sectionNum?: number
+): TableState | null {
+  const children = node.childNodes
+  if (!children) return tableCtx
+  for (let i = 0; i < children.length; i++) {
+    const el = children[i] as Element
+    if (el.nodeType !== 1) continue
+    const tag = el.tagName || el.localName || ""
+    const localTag = tag.replace(/^[^:]+:/, "")
+    // 테이블은 walkSection으로 위임
+    if (localTag === "tbl") {
+      if (tableCtx) tableStack.push(tableCtx)
+      const newTable: TableState = { rows: [], currentRow: [], cell: null }
+      walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum)
+      if (newTable.rows.length > 0) {
+        if (tableStack.length > 0) {
+          const parentTable = tableStack.pop()!
+          const nestedText = convertTableToText(newTable.rows)
+          if (parentTable.cell) {
+            parentTable.cell.text += (parentTable.cell.text ? "\n" : "") + nestedText
+          }
+          tableCtx = parentTable
+        } else {
+          blocks.push({ type: "table", table: buildTable(newTable.rows), pageNumber: sectionNum })
+          tableCtx = null
+        }
+      } else {
+        tableCtx = tableStack.length > 0 ? tableStack.pop()! : null
+      }
+    } else if (localTag === "pic" || localTag === "shape" || localTag === "drawingObject") {
+      if (warnings && sectionNum) {
+        warnings.push({ page: sectionNum, message: `스킵된 요소: ${localTag}`, code: "SKIPPED_IMAGE" })
+      }
+    }
+  }
+  return tableCtx
+}
+
+interface ParagraphInfo {
+  text: string
+  href?: string
+  footnote?: string
+  style?: InlineStyle
+}
+
+function extractParagraphInfo(para: Element, styleMap?: HwpxStyleMap): ParagraphInfo {
   let text = ""
+  let href: string | undefined
+  let footnote: string | undefined
+  let charPrId: string | undefined
+
+  // 문단의 스타일 참조 → charPr로 간접 조회
+  // HWPX <p>에는 paraPrIDRef/styleIDRef가 있고, charPrIDRef는 <r> 요소에 있음
+  // 여기서는 일단 null — <r> 요소에서 charPrIDRef를 가져옴
+
   const walk = (node: Node) => {
     const children = node.childNodes
     if (!children) return
@@ -434,10 +658,65 @@ function extractParagraphText(para: Node): string {
           break
         case "fwSpace": case "hwSpace": text += " "; break
         case "tbl": break // 테이블은 walkSection에서 처리
+
+        // 하이퍼링크
+        case "hyperlink": {
+          const url = child.getAttribute("url") || child.getAttribute("href") || ""
+          if (url) href = url
+          // 하이퍼링크 내 텍스트 추출
+          walk(child)
+          break
+        }
+
+        // 각주/미주
+        case "footNote": case "endNote": case "fn": case "en": {
+          const noteText = extractTextFromNode(child)
+          if (noteText) footnote = (footnote ? footnote + "; " : "") + noteText
+          break
+        }
+
+        // run 요소에서 charPrIDRef 추출
+        case "r": {
+          const runCharPr = child.getAttribute("charPrIDRef")
+          if (runCharPr && !charPrId) charPrId = runCharPr
+          walk(child)
+          break
+        }
+
         default: walk(child); break
       }
     }
   }
   walk(para)
-  return text.replace(/[ \t]+/g, " ").trim()
+
+  const cleanText = text.replace(/[ \t]+/g, " ").trim()
+
+  // 스타일 정보 조회
+  let style: InlineStyle | undefined
+  if (styleMap && charPrId) {
+    const charProp = styleMap.charProperties.get(charPrId)
+    if (charProp) {
+      style = {}
+      if (charProp.fontSize) style.fontSize = charProp.fontSize
+      if (charProp.bold) style.bold = true
+      if (charProp.italic) style.italic = true
+      if (charProp.fontName) style.fontName = charProp.fontName
+      if (!style.fontSize && !style.bold && !style.italic) style = undefined
+    }
+  }
+
+  return { text: cleanText, href, footnote, style }
+}
+
+/** 노드 내 모든 텍스트를 재귀적으로 추출 */
+function extractTextFromNode(node: Node): string {
+  let result = ""
+  const children = node.childNodes
+  if (!children) return result
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i]
+    if (child.nodeType === 3) result += child.textContent || ""
+    else if (child.nodeType === 1) result += extractTextFromNode(child)
+  }
+  return result.trim()
 }

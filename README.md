@@ -14,7 +14,19 @@
 
 ---
 
-## What's New in v1.4.1
+## What's New in v1.5.0
+
+- **Line-Based Table Detection (PDF)** — Ported from OpenDataLoader. Extracts horizontal/vertical lines from PDF graphics commands, builds grid via intersection vertices, maps text to cells by bbox overlap. Proper colspan/rowspan detection. Falls back to heuristic for line-free PDFs.
+- **IRBlock v2** — 6 block types: `heading`, `paragraph`, `table`, `list`, `image`, `separator`. New fields: `bbox`, `style`, `pageNumber`, `level`, `href`, `footnoteText`.
+- **ParseResult v2** — `outline` (document structure) and `warnings` (skipped elements, hidden text) fields.
+- **PDF Enhancements** — XY-Cut reading order, heading detection (font-size ratio), hidden text filtering (prompt injection defense), bounding box on every block.
+- **HWP5 Enhancements** — CHAR_SHAPE parsing, style-based heading detection, warnings for skipped OLE/images.
+- **HWPX Enhancements** — Style parsing from header.xml, hyperlink/footnote extraction.
+- **List Detection** — Numbered paragraphs after tables auto-converted to ordered list blocks.
+- **MCP Server** — Now returns `outline` and `warnings` in parse_document responses.
+
+<details>
+<summary>v1.4.x features</summary>
 
 - **Document Compare** — Diff two documents at IR level. Cross-format (HWP vs HWPX) supported.
 - **Form Field Recognition** — Extract label-value pairs from government forms automatically.
@@ -25,6 +37,8 @@
 - **Watch Mode** — `kordoc watch ./incoming --webhook https://...` for auto-conversion.
 - **7 MCP Tools** — parse_document, detect_format, parse_metadata, parse_pages, parse_table, compare_documents, parse_form.
 - **Error Codes** — Structured `code` field: `"ENCRYPTED"`, `"ZIP_BOMB"`, `"IMAGE_BASED_PDF"`, etc.
+
+</details>
 
 ---
 
@@ -177,7 +191,8 @@ npx kordoc watch ./docs --webhook https://api/hook # webhook notification
 ```typescript
 import type {
   ParseResult, ParseSuccess, ParseFailure, FileType,
-  IRBlock, IRTable, IRCell, CellContext,
+  IRBlock, IRBlockType, IRTable, IRCell, CellContext,
+  BoundingBox, InlineStyle, OutlineItem, ParseWarning, WarningCode,
   DocumentMetadata, ParseOptions, ErrorCode,
   DiffResult, BlockDiff, CellDiff, DiffChangeType,
   FormField, FormResult,
@@ -191,7 +206,7 @@ import type {
 |--------|--------|----------|
 | **HWPX** (한컴 2020+) | ZIP + XML DOM | Manifest, nested tables, merged cells, broken ZIP recovery |
 | **HWP 5.x** (한컴 Legacy) | OLE2 + CFB | 21 control chars, zlib decompression, DRM detection |
-| **PDF** | pdfjs-dist | Line grouping, table detection, image PDF + OCR |
+| **PDF** | pdfjs-dist | Line-based table detection, XY-Cut reading order, heading detection, hidden text filter, OCR |
 
 ## Security
 

@@ -87,9 +87,38 @@ export function blocksToMarkdown(blocks: IRBlock[]): string {
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i]
 
-    if (block.type === "paragraph" && block.text) {
-      const text = block.text
+    // 헤딩 블록
+    if (block.type === "heading" && block.text) {
+      const prefix = "#".repeat(Math.min(block.level || 2, 6))
+      lines.push("", `${prefix} ${block.text}`, "")
+      continue
+    }
 
+    // 구분선 블록
+    if (block.type === "separator") {
+      lines.push("", "---", "")
+      continue
+    }
+
+    // 리스트 블록
+    if (block.type === "list" && block.text) {
+      // 텍스트가 이미 번호로 시작하면 그대로 출력 (원래 번호 보존)
+      const alreadyNumbered = block.listType === "ordered" && /^\d+\.\s/.test(block.text)
+      const prefix = alreadyNumbered ? "" : block.listType === "ordered" ? "1. " : "- "
+      lines.push(`${prefix}${block.text}`)
+      if (block.children) {
+        for (const child of block.children) {
+          const childPrefix = child.listType === "ordered" ? "1." : "-"
+          lines.push(`  ${childPrefix} ${child.text || ""}`)
+        }
+      }
+      continue
+    }
+
+    if (block.type === "paragraph" && block.text) {
+      let text = block.text
+
+      // 별표 패턴 (기존 호환)
       if (/^\[별표\s*\d+/.test(text)) {
         const nextBlock = blocks[i + 1]
         if (nextBlock?.type === "paragraph" && nextBlock.text && /관련\)?$/.test(nextBlock.text)) {
@@ -106,9 +135,24 @@ export function blocksToMarkdown(blocks: IRBlock[]): string {
         continue
       }
 
+      // 하이퍼링크가 있으면 텍스트에 링크 삽입
+      if (block.href) {
+        text = `[${text}](${block.href})`
+      }
+
+      // 각주가 있으면 괄호로 인라인 삽입
+      if (block.footnoteText) {
+        text += ` (주: ${block.footnoteText})`
+      }
+
       lines.push(text)
     } else if (block.type === "table" && block.table) {
+      // 테이블 앞에 빈 줄 보장 (마크다운 렌더링 필수)
+      if (lines.length > 0 && lines[lines.length - 1] !== "") {
+        lines.push("")
+      }
       lines.push(tableToMarkdown(block.table))
+      lines.push("")
     }
   }
 

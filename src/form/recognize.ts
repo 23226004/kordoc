@@ -47,7 +47,7 @@ export function extractFormFields(blocks: IRBlock[]): FormResult {
     }
   }
 
-  // 인라인 "라벨: 값" 패턴도 검사
+  // 인라인 "라벨: 값" 패턴도 검사 (paragraph만 — heading/list는 양식 필드가 아님)
   for (const block of blocks) {
     if (block.type === "paragraph" && block.text) {
       const inlineFields = extractInlineFields(block.text)

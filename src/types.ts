@@ -8,10 +8,46 @@ export interface CellContext {
   rowSpan: number
 }
 
+/** 블록 타입 — v2.0에서 heading, list, image, separator 추가 */
+export type IRBlockType = "paragraph" | "table" | "heading" | "list" | "image" | "separator"
+
 export interface IRBlock {
-  type: "paragraph" | "table"
+  type: IRBlockType
   text?: string
   table?: IRTable
+  /** 헤딩 레벨 (1-6), type="heading"일 때 사용 */
+  level?: number
+  /** 원본 페이지 번호 (1-based) */
+  pageNumber?: number
+  /** 바운딩 박스 — PDF에서만 제공 */
+  bbox?: BoundingBox
+  /** 텍스트 스타일 정보 (선택) */
+  style?: InlineStyle
+  /** 리스트 타입, type="list"일 때 사용 */
+  listType?: "ordered" | "unordered"
+  /** 중첩 리스트 아이템 */
+  children?: IRBlock[]
+  /** 하이퍼링크 URL */
+  href?: string
+  /** 각주/미주 텍스트 (인라인 삽입용) */
+  footnoteText?: string
+}
+
+/** 바운딩 박스 — PDF 포인트 단위 (72pt = 1인치) */
+export interface BoundingBox {
+  page: number
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** 인라인 텍스트 스타일 */
+export interface InlineStyle {
+  bold?: boolean
+  italic?: boolean
+  fontSize?: number
+  fontName?: string
 }
 
 export interface IRTable {
@@ -67,6 +103,34 @@ export interface ParseOptions {
   ocr?: OcrProvider
 }
 
+// ─── 파싱 경고 ──────────────────────────────────────
+
+/** 파싱 중 스킵/실패한 요소 보고 */
+export interface ParseWarning {
+  /** 관련 페이지 번호 (알 수 있는 경우) */
+  page?: number
+  /** 경고 메시지 */
+  message: string
+  /** 구조화된 경고 코드 */
+  code: WarningCode
+}
+
+export type WarningCode =
+  | "SKIPPED_IMAGE"
+  | "SKIPPED_OLE"
+  | "TRUNCATED_TABLE"
+  | "OCR_FALLBACK"
+  | "UNSUPPORTED_ELEMENT"
+  | "BROKEN_ZIP_RECOVERY"
+  | "HIDDEN_TEXT_FILTERED"
+
+/** 문서 구조 (헤딩 트리) */
+export interface OutlineItem {
+  level: number
+  text: string
+  pageNumber?: number
+}
+
 // ─── 에러 코드 ──────────────────────────────────────
 
 /** 구조화된 에러 코드 — 프로그래밍적 에러 핸들링용 */
@@ -102,6 +166,10 @@ export interface ParseSuccess extends ParseResultBase {
   blocks: IRBlock[]
   /** 문서 메타데이터 */
   metadata?: DocumentMetadata
+  /** 문서 구조 (헤딩 트리) — v2.0 */
+  outline?: OutlineItem[]
+  /** 파싱 중 발생한 경고 — v2.0 */
+  warnings?: ParseWarning[]
 }
 
 export interface ParseFailure extends ParseResultBase {
@@ -185,4 +253,6 @@ export interface InternalParseResult {
   markdown: string
   blocks: IRBlock[]
   metadata?: DocumentMetadata
+  outline?: OutlineItem[]
+  warnings?: ParseWarning[]
 }

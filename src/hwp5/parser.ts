@@ -1,13 +1,13 @@
 /** HWP 5.x 바이너리 파서 — OLE2 컨테이너 → 섹션 → Markdown */
 
 import {
-  readRecords, decompressStream, parseFileHeader, extractText,
-  TAG_PARA_HEADER, TAG_PARA_TEXT, TAG_CTRL_HEADER, TAG_LIST_HEADER, TAG_TABLE,
+  readRecords, decompressStream, parseFileHeader, extractText, parseDocInfo,
+  TAG_PARA_HEADER, TAG_PARA_TEXT, TAG_CHAR_SHAPE, TAG_CTRL_HEADER, TAG_LIST_HEADER, TAG_TABLE,
   FLAG_COMPRESSED, FLAG_ENCRYPTED, FLAG_DRM,
-  type HwpRecord,
+  type HwpRecord, type HwpDocInfo, type HwpCharShape,
 } from "./record.js"
 import { buildTable, blocksToMarkdown, MAX_COLS, MAX_ROWS } from "../table/builder.js"
-import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions } from "../types.js"
+import type { CellContext, IRBlock, DocumentMetadata, InternalParseResult, ParseOptions, ParseWarning, OutlineItem, InlineStyle } from "../types.js"
 import { KordocError } from "../utils.js"
 import { parsePageRange } from "../page-range.js"
 
@@ -43,6 +43,10 @@ export function parseHwp5Document(buffer: Buffer, options?: ParseOptions): Inter
   }
   extractHwp5Metadata(cfb, metadata)
 
+  // DocInfo 파싱 (스타일 정보 추출)
+  const docInfo = parseDocInfoStream(cfb, compressed)
+  const warnings: ParseWarning[] = []
+
   const sections = findSections(cfb)
   if (sections.length === 0) throw new KordocError("섹션 스트림을 찾을 수 없습니다")
 
@@ -60,11 +64,91 @@ export function parseHwp5Document(buffer: Buffer, options?: ParseOptions): Inter
     totalDecompressed += data.length
     if (totalDecompressed > MAX_TOTAL_DECOMPRESS) throw new KordocError("총 압축 해제 크기 초과 (decompression bomb 의심)")
     const records = readRecords(data)
-    blocks.push(...parseSection(records))
+    const sectionBlocks = parseSection(records, docInfo, warnings, si + 1)
+    blocks.push(...sectionBlocks)
   }
 
+  // 스타일 기반 헤딩 감지
+  if (docInfo) {
+    detectHwp5Headings(blocks, docInfo)
+  }
+
+  // outline 구축
+  const outline: OutlineItem[] = blocks
+    .filter(b => b.type === "heading" && b.level && b.text)
+    .map(b => ({ level: b.level!, text: b.text!, pageNumber: b.pageNumber }))
+
   const markdown = blocksToMarkdown(blocks)
-  return { markdown, blocks, metadata }
+  return { markdown, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined }
+}
+
+/** DocInfo 스트림 파싱 (best-effort) */
+function parseDocInfoStream(cfb: CfbContainer, compressed: boolean): HwpDocInfo | null {
+  try {
+    const entry = CFB.find(cfb, "/DocInfo")
+    if (!entry?.content) return null
+    const data = compressed ? decompressStream(Buffer.from(entry.content)) : Buffer.from(entry.content)
+    const records = readRecords(data)
+    return parseDocInfo(records)
+  } catch {
+    return null
+  }
+}
+
+/** 스타일 기반 헤딩 감지 — 큰 폰트 + 짧은 텍스트 → heading */
+function detectHwp5Headings(blocks: IRBlock[], docInfo: HwpDocInfo): void {
+  // 기본 폰트 크기 결정 (본문 스타일 또는 가장 많이 사용되는 크기)
+  let baseFontSize = 0
+
+  // "바탕글", "본문" 등 본문 스타일 찾기
+  for (const style of docInfo.styles) {
+    const name = (style.nameKo || style.name).toLowerCase()
+    if (name.includes("바탕") || name.includes("본문") || name === "normal" || name === "body") {
+      const cs = docInfo.charShapes[style.charShapeId]
+      // cs.fontSize는 0.1pt 단위 → pt로 변환 (블록의 style.fontSize와 동일 단위)
+      if (cs?.fontSize > 0) { baseFontSize = cs.fontSize / 10; break }
+    }
+  }
+
+  // 본문 스타일 못 찾으면 블록의 폰트 크기 중 최빈값 사용
+  if (baseFontSize === 0) {
+    const sizeFreq = new Map<number, number>()
+    for (const b of blocks) {
+      if (b.style?.fontSize) {
+        sizeFreq.set(b.style.fontSize, (sizeFreq.get(b.style.fontSize) || 0) + 1)
+      }
+    }
+    let maxCount = 0
+    for (const [size, count] of sizeFreq) {
+      if (count > maxCount) { maxCount = count; baseFontSize = size }
+    }
+  }
+
+  if (baseFontSize <= 0) return
+
+  for (const block of blocks) {
+    if (block.type !== "paragraph" || !block.text || !block.style?.fontSize) continue
+    const text = block.text.trim()
+    if (text.length === 0 || text.length > 200) continue
+    if (/^\d+$/.test(text)) continue
+
+    const ratio = block.style.fontSize / baseFontSize
+    let level = 0
+    // 통일된 threshold: PDF/HWPX와 동일 (1.5/1.3/1.15)
+    if (ratio >= 1.5) level = 1
+    else if (ratio >= 1.3) level = 2
+    else if (ratio >= 1.15) level = 3
+
+    // "제N조", "제N장" 패턴은 heading으로 강제 지정
+    if (/^제\d+[조장절편]/.test(text) && text.length <= 50) {
+      if (level === 0) level = 3
+    }
+
+    if (level > 0) {
+      block.type = "heading"
+      block.level = level
+    }
+  }
 }
 
 // ─── 메타데이터 추출 (best-effort) ───────────────────
@@ -168,7 +252,7 @@ function findSections(cfb: CfbContainer): Buffer[] {
   return sections.sort((a, b) => a.idx - b.idx).map(s => s.content)
 }
 
-function parseSection(records: HwpRecord[]): IRBlock[] {
+function parseSection(records: HwpRecord[], docInfo: HwpDocInfo | null, warnings: ParseWarning[], sectionNum: number): IRBlock[] {
   const blocks: IRBlock[] = []
   let i = 0
 
@@ -176,9 +260,17 @@ function parseSection(records: HwpRecord[]): IRBlock[] {
     const rec = records[i]
 
     if (rec.tagId === TAG_PARA_HEADER && rec.level === 0) {
-      const { paragraph, tables, nextIdx } = parseParagraphWithTables(records, i)
-      if (paragraph) blocks.push({ type: "paragraph", text: paragraph })
-      for (const t of tables) blocks.push({ type: "table", table: t })
+      const { paragraph, tables, nextIdx, charShapeIds } = parseParagraphWithTables(records, i)
+      if (paragraph) {
+        const block: IRBlock = { type: "paragraph", text: paragraph, pageNumber: sectionNum }
+        // CHAR_SHAPE 기반 스타일 정보 추가
+        if (docInfo && charShapeIds.length > 0) {
+          const style = resolveCharStyle(charShapeIds, docInfo)
+          if (style) block.style = style
+        }
+        blocks.push(block)
+      }
+      for (const t of tables) blocks.push({ type: "table", table: t, pageNumber: sectionNum })
       i = nextIdx
       continue
     }
@@ -187,9 +279,13 @@ function parseSection(records: HwpRecord[]): IRBlock[] {
       const ctrlId = rec.data.subarray(0, 4).toString("ascii")
       if (ctrlId === " lbt" || ctrlId === "tbl ") {
         const { table, nextIdx } = parseTableBlock(records, i)
-        if (table) blocks.push({ type: "table", table })
+        if (table) blocks.push({ type: "table", table, pageNumber: sectionNum })
         i = nextIdx
         continue
+      }
+      // 이미지/OLE 제어 — 경고 수집
+      if (ctrlId === "gso " || ctrlId === " osg" || ctrlId === " elo" || ctrlId === "ole ") {
+        warnings.push({ page: sectionNum, message: `스킵된 제어 요소: ${ctrlId.trim()}`, code: "SKIPPED_IMAGE" })
       }
     }
 
@@ -199,10 +295,35 @@ function parseSection(records: HwpRecord[]): IRBlock[] {
   return blocks
 }
 
+/** CHAR_SHAPE ID 배열에서 대표 스타일 결정 (최빈값) */
+function resolveCharStyle(charShapeIds: number[], docInfo: HwpDocInfo): InlineStyle | undefined {
+  if (charShapeIds.length === 0 || docInfo.charShapes.length === 0) return undefined
+
+  // 가장 많이 나타나는 charShapeId 사용
+  const freq = new Map<number, number>()
+  let maxCount = 0, dominantId = charShapeIds[0]
+  for (const id of charShapeIds) {
+    const count = (freq.get(id) || 0) + 1
+    freq.set(id, count)
+    if (count > maxCount) { maxCount = count; dominantId = id }
+  }
+
+  const cs = docInfo.charShapes[dominantId]
+  if (!cs) return undefined
+
+  const style: InlineStyle = {}
+  if (cs.fontSize > 0) style.fontSize = cs.fontSize / 10  // 0.1pt → pt
+  if (cs.attrFlags & 0x01) style.italic = true
+  if (cs.attrFlags & 0x02) style.bold = true
+
+  return (style.fontSize || style.bold || style.italic) ? style : undefined
+}
+
 function parseParagraphWithTables(records: HwpRecord[], startIdx: number) {
   const startLevel = records[startIdx].level
   let text = ""
   const tables: ReturnType<typeof buildTable>[] = []
+  const charShapeIds: number[] = []
   let i = startIdx + 1
 
   while (i < records.length) {
@@ -211,6 +332,14 @@ function parseParagraphWithTables(records: HwpRecord[], startIdx: number) {
 
     if (rec.tagId === TAG_PARA_TEXT) {
       text = extractText(rec.data)
+    }
+
+    // CHAR_SHAPE 레코드 — 문단 내 글자 모양 인덱스 배열
+    if (rec.tagId === TAG_CHAR_SHAPE && rec.data.length >= 8) {
+      // 구조: [position(u32) + charShapeId(u32)] * N
+      for (let offset = 0; offset + 7 < rec.data.length; offset += 8) {
+        charShapeIds.push(rec.data.readUInt32LE(offset + 4))
+      }
     }
 
     if (rec.tagId === TAG_CTRL_HEADER && rec.data.length >= 4) {
@@ -226,7 +355,7 @@ function parseParagraphWithTables(records: HwpRecord[], startIdx: number) {
   }
 
   const trimmed = text.trim()
-  return { paragraph: trimmed || null, tables, nextIdx: i }
+  return { paragraph: trimmed || null, tables, nextIdx: i, charShapeIds }
 }
 
 function parseTableBlock(records: HwpRecord[], startIdx: number) {

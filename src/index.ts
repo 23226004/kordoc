@@ -50,8 +50,8 @@ export async function parse(buffer: ArrayBuffer, options?: ParseOptions): Promis
 /** HWPX 파일을 Markdown으로 변환 */
 export async function parseHwpx(buffer: ArrayBuffer, options?: ParseOptions): Promise<ParseResult> {
   try {
-    const { markdown, blocks, metadata } = await parseHwpxDocument(buffer, options)
-    return { success: true, fileType: "hwpx", markdown, blocks, metadata }
+    const { markdown, blocks, metadata, outline, warnings } = await parseHwpxDocument(buffer, options)
+    return { success: true, fileType: "hwpx", markdown, blocks, metadata, outline, warnings }
   } catch (err) {
     return { success: false, fileType: "hwpx", error: err instanceof Error ? err.message : "HWPX 파싱 실패", code: classifyError(err) }
   }
@@ -60,8 +60,8 @@ export async function parseHwpx(buffer: ArrayBuffer, options?: ParseOptions): Pr
 /** HWP 5.x 바이너리 파일을 Markdown으로 변환 */
 export async function parseHwp(buffer: ArrayBuffer, options?: ParseOptions): Promise<ParseResult> {
   try {
-    const { markdown, blocks, metadata } = parseHwp5Document(Buffer.from(buffer), options)
-    return { success: true, fileType: "hwp", markdown, blocks, metadata }
+    const { markdown, blocks, metadata, outline, warnings } = parseHwp5Document(Buffer.from(buffer), options)
+    return { success: true, fileType: "hwp", markdown, blocks, metadata, outline, warnings }
   } catch (err) {
     return { success: false, fileType: "hwp", error: err instanceof Error ? err.message : "HWP 파싱 실패", code: classifyError(err) }
   }
@@ -87,8 +87,10 @@ export { markdownToHwpx } from "./hwpx/generator.js"
 export { detectFormat, isHwpxFile, isOldHwpFile, isPdfFile } from "./detect.js"
 export type {
   ParseResult, ParseSuccess, ParseFailure, FileType,
-  IRBlock, IRTable, IRCell, CellContext,
+  IRBlock, IRBlockType, IRTable, IRCell, CellContext,
+  BoundingBox, InlineStyle,
   DocumentMetadata, ParseOptions, ErrorCode,
+  ParseWarning, WarningCode, OutlineItem,
   DiffResult, BlockDiff, CellDiff, DiffChangeType,
   FormField, FormResult,
   OcrProvider, WatchOptions,

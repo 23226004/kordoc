@@ -80,8 +80,23 @@ server.tool(
         result.isImageBased ? "이미지 기반 PDF (텍스트 추출 불가)" : null,
       ].filter(Boolean).join(" | ")
 
+      // outline/warnings 부가 정보 추가
+      const parts: string[] = [`[${meta}]`]
+
+      if (result.outline && result.outline.length > 0) {
+        const outlineText = result.outline.map(o => `${"  ".repeat(o.level - 1)}- ${o.text}`).join("\n")
+        parts.push(`\n📑 문서 구조:\n${outlineText}`)
+      }
+
+      if (result.warnings && result.warnings.length > 0) {
+        const warnText = result.warnings.map(w => `- [p${w.page || "?"}] ${w.message}`).join("\n")
+        parts.push(`\n⚠️ 경고:\n${warnText}`)
+      }
+
+      parts.push(`\n\n${result.markdown}`)
+
       return {
-        content: [{ type: "text", text: `[${meta}]\n\n${result.markdown}` }],
+        content: [{ type: "text", text: parts.join("") }],
       }
     } catch (err) {
       return {

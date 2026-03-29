@@ -130,13 +130,17 @@ function fallbackAlign(a: IRBlock[], b: IRBlock[]): [IRBlock | null, IRBlock | n
 function blockSimilarity(a: IRBlock, b: IRBlock): number {
   if (a.type !== b.type) return 0
 
-  if (a.type === "paragraph") {
+  // 텍스트 기반 블록: paragraph, heading, list, image(alt text)
+  if (a.text !== undefined && b.text !== undefined) {
     return normalizedSimilarity(a.text || "", b.text || "")
   }
 
   if (a.type === "table" && a.table && b.table) {
     return tableSimilarity(a.table, b.table)
   }
+
+  // separator 등 텍스트 없는 동일 타입 → 완전 일치
+  if (a.type === b.type) return 1
 
   return 0
 }

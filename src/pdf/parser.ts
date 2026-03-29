@@ -5,12 +5,14 @@
  * ES 모듈 호이스팅 때문에 별도 파일로 분리되어 있음.
  */
 
-import type { ParseResult, IRBlock, DocumentMetadata, ParseOptions } from "../types.js"
+import type { ParseResult, IRBlock, IRTable, DocumentMetadata, ParseOptions, BoundingBox, ParseWarning, OutlineItem } from "../types.js"
 import { KordocError } from "../utils.js"
 import { parsePageRange } from "../page-range.js"
+import { blocksToMarkdown } from "../table/builder.js"
+import { extractLines, filterPageBorderLines, buildTableGrids, extractCells, mapTextToCells, cellTextToString, type TextItem, type TableGrid, type ExtractedCell } from "./line-detector.js"
 // polyfill 먼저 (ES 모듈 호이스팅되므로 별도 파일 필수)
 import "./polyfill.js"
-import { getDocument, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs"
+import { getDocument, OPS, GlobalWorkerOptions } from "pdfjs-dist/legacy/build/pdf.mjs"
 
 // worker 비활성화 (polyfill에서 pdfjsWorker를 이미 주입했으므로)
 GlobalWorkerOptions.workerSrc = ""
@@ -24,6 +26,7 @@ interface PdfTextItem {
   transform: number[]
   width: number
   height: number
+  fontName?: string
 }
 
 interface NormItem {
@@ -32,6 +35,11 @@ interface NormItem {
   y: number
   w: number
   h: number
+  /** 폰트 높이(≈폰트 크기) — 헤딩 감지용 */
+  fontSize: number
+  fontName: string
+  /** hidden text 여부 (투명/0pt) */
+  isHidden: boolean
 }
 
 export async function parsePdfDocument(buffer: ArrayBuffer, options?: ParseOptions): Promise<ParseResult> {
@@ -44,14 +52,14 @@ export async function parsePdfDocument(buffer: ArrayBuffer, options?: ParseOptio
 
   try {
     const pageCount = doc.numPages
-    if (pageCount === 0) return { success: false, fileType: "pdf", pageCount: 0, error: "PDF에 페이지가 없습니다.", blocks: [] } as unknown as ParseResult
+    if (pageCount === 0) return { success: false, fileType: "pdf", pageCount: 0, error: "PDF에 페이지가 없습니다.", code: "PARSE_ERROR" }
 
     // 메타데이터 추출 (best-effort)
     const metadata: DocumentMetadata = { pageCount }
     await extractPdfMetadata(doc, metadata)
 
-    const pageTexts: string[] = []
     const blocks: IRBlock[] = []
+    const warnings: ParseWarning[] = []
     let totalChars = 0
     let totalTextBytes = 0
     const effectivePageCount = Math.min(pageCount, MAX_PAGES)
@@ -59,28 +67,52 @@ export async function parsePdfDocument(buffer: ArrayBuffer, options?: ParseOptio
     // 페이지 범위 필터링
     const pageFilter = options?.pages ? parsePageRange(options.pages, effectivePageCount) : null
 
+    // 전체 문서의 폰트 크기 통계 수집 (헤딩 감지용)
+    const allFontSizes: number[] = []
+
     for (let i = 1; i <= effectivePageCount; i++) {
       if (pageFilter && !pageFilter.has(i)) continue
       const page = await doc.getPage(i)
       const tc = await page.getTextContent()
-      const pageText = extractPageContent(tc.items as PdfTextItem[])
-      totalChars += pageText.replace(/\s/g, "").length
-      totalTextBytes += pageText.length * 2
+      const viewport = page.getViewport({ scale: 1 })
+      const rawItems = tc.items as PdfTextItem[]
+      const items = normalizeItems(rawItems)
+
+      // hidden text 필터링 + 경고 수집
+      const { visible, hiddenCount } = filterHiddenText(items, viewport.width, viewport.height)
+      if (hiddenCount > 0) {
+        warnings.push({ page: i, message: `${hiddenCount}개 숨겨진 텍스트 요소 필터링됨`, code: "HIDDEN_TEXT_FILTERED" })
+      }
+
+      // 폰트 크기 통계 수집
+      for (const item of visible) {
+        if (item.fontSize > 0) allFontSizes.push(item.fontSize)
+      }
+
+      // 선 기반 테이블 감지를 위한 operatorList
+      const opList = await page.getOperatorList()
+
+      const pageBlocks = extractPageBlocksWithLines(visible, i, opList, viewport.width, viewport.height)
+      for (const b of pageBlocks) blocks.push(b)
+
+      // 이미지 기반 PDF 감지 + 크기 제한용 문자 수 집계
+      for (const b of pageBlocks) {
+        const t = b.text || ""
+        totalChars += t.replace(/\s/g, "").length
+        totalTextBytes += t.length * 2
+      }
       if (totalTextBytes > MAX_TOTAL_TEXT) throw new KordocError("텍스트 추출 크기 초과")
-      pageTexts.push(pageText)
-      blocks.push({ type: "paragraph", text: pageText })
     }
 
     const parsedPageCount = pageFilter ? pageFilter.size : effectivePageCount
     if (totalChars / Math.max(parsedPageCount, 1) < 10) {
-      // OCR 프로바이더가 있으면 이미지 기반 PDF도 텍스트 추출 시도
       if (options?.ocr) {
         try {
           const { ocrPages } = await import("../ocr/provider.js")
           const ocrBlocks = await ocrPages(doc, options.ocr, pageFilter, effectivePageCount)
           if (ocrBlocks.length > 0) {
             const ocrMarkdown = ocrBlocks.map(b => b.text || "").filter(Boolean).join("\n\n")
-            return { success: true, fileType: "pdf", markdown: ocrMarkdown, pageCount: parsedPageCount, blocks: ocrBlocks, metadata, isImageBased: true }
+            return { success: true, fileType: "pdf", markdown: ocrMarkdown, pageCount: parsedPageCount, blocks: ocrBlocks, metadata, isImageBased: true, warnings }
           }
         } catch {
           // OCR 실패 시 원래 에러 반환
@@ -89,10 +121,21 @@ export async function parsePdfDocument(buffer: ArrayBuffer, options?: ParseOptio
       return { success: false, fileType: "pdf", pageCount, isImageBased: true, error: `이미지 기반 PDF (${pageCount}페이지, ${totalChars}자)`, code: "IMAGE_BASED_PDF" }
     }
 
-    let markdown = pageTexts.filter(t => t.trim()).join("\n\n")
-    markdown = cleanPdfText(markdown)
+    // 헤딩 감지: 폰트 크기 기반
+    const medianFontSize = computeMedianFontSize(allFontSizes)
+    if (medianFontSize > 0) {
+      detectHeadings(blocks, medianFontSize)
+    }
 
-    return { success: true, fileType: "pdf", markdown, pageCount: parsedPageCount, blocks, metadata }
+    // outline 구축
+    const outline: OutlineItem[] = blocks
+      .filter(b => b.type === "heading" && b.level && b.text)
+      .map(b => ({ level: b.level!, text: b.text!, pageNumber: b.pageNumber }))
+
+    // blocksToMarkdown로 통일 — 헤딩 마크다운 반영 (HWP5/HWPX와 일관성)
+    let markdown = cleanPdfText(blocksToMarkdown(blocks))
+
+    return { success: true, fileType: "pdf", markdown, pageCount: parsedPageCount, blocks, metadata, outline: outline.length > 0 ? outline : undefined, warnings: warnings.length > 0 ? warnings : undefined }
   } finally {
     await doc.destroy().catch(() => {})
   }
@@ -147,34 +190,397 @@ export async function extractPdfMetadataOnly(buffer: ArrayBuffer): Promise<Docum
 }
 
 // ═══════════════════════════════════════════════════════
-// 페이지 콘텐츠 추출 (열 경계 학습 기반 테이블 감지)
+// Hidden text 필터링 (prompt injection 방어)
 // ═══════════════════════════════════════════════════════
 
-function extractPageContent(rawItems: PdfTextItem[]): string {
-  const items = normalizeItems(rawItems)
-  if (items.length === 0) return ""
+function filterHiddenText(items: NormItem[], pageWidth: number, pageHeight: number): { visible: NormItem[]; hiddenCount: number } {
+  let hiddenCount = 0
+  const visible: NormItem[] = []
 
-  const yLines = groupByY(items)
-  const columns = detectColumns(yLines)
-
-  if (columns && columns.length >= 3) {
-    return extractWithColumns(yLines, columns)
+  for (const item of items) {
+    // 0pt 폰트 / 너비 0 → 숨겨진 텍스트
+    if (item.isHidden) { hiddenCount++; continue }
+    // 페이지 범위 밖 (여백 10% 허용)
+    const margin = Math.max(pageWidth, pageHeight) * 0.1
+    if (item.x < -margin || item.x > pageWidth + margin || item.y < -margin || item.y > pageHeight + margin) {
+      hiddenCount++; continue
+    }
+    visible.push(item)
   }
 
-  // 테이블 없으면 기존 방식
-  return yLines.map(line => mergeLineSimple(line)).join("\n")
+  return { visible, hiddenCount }
+}
+
+// ═══════════════════════════════════════════════════════
+// 헤딩 감지 (폰트 크기 기반)
+// ═══════════════════════════════════════════════════════
+
+function computeMedianFontSize(sizes: number[]): number {
+  if (sizes.length === 0) return 0
+  const sorted = [...sizes].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+}
+
+/**
+ * 블록의 폰트 크기를 median과 비교하여 헤딩으로 승격.
+ * - 150%+ → heading level 1
+ * - 130%+ → heading level 2
+ * - 115%+ → heading level 3
+ * 조건: 짧은 텍스트 (200자 미만), 숫자만으로 구성되지 않음
+ */
+function detectHeadings(blocks: IRBlock[], medianFontSize: number): void {
+  for (const block of blocks) {
+    if (block.type !== "paragraph" || !block.text || !block.style?.fontSize) continue
+    const text = block.text.trim()
+    if (text.length === 0 || text.length > 200) continue
+    // 숫자만이면 헤딩 아님
+    if (/^\d+$/.test(text)) continue
+
+    const ratio = block.style.fontSize / medianFontSize
+    let level = 0
+    if (ratio >= 1.5) level = 1
+    else if (ratio >= 1.3) level = 2
+    else if (ratio >= 1.15) level = 3
+
+    if (level > 0) {
+      block.type = "heading"
+      block.level = level
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// XY-Cut 읽기 순서 알고리즘
+// ═══════════════════════════════════════════════════════
+
+interface TextRegion {
+  items: NormItem[]
+  minX: number; minY: number; maxX: number; maxY: number
+}
+
+/**
+ * XY-Cut: 페이지를 재귀적으로 X/Y축 공백으로 분할하여 읽기 순서 결정.
+ * - Y축 분할 (수평 공백 감지) → 위에서 아래
+ * - X축 분할 (수직 공백 감지) → 왼쪽에서 오른쪽
+ * - 분할 불가능하면 리프 노드 (하나의 텍스트 블록)
+ */
+/** 재귀 깊이 제한 — 수천 아이템의 pathological 레이아웃에서 스택 오버플로 방지 */
+const MAX_XYCUT_DEPTH = 50
+
+function xyCutOrder(items: NormItem[], gapThreshold: number, depth = 0): NormItem[][] {
+  if (items.length === 0) return []
+  if (items.length <= 2 || depth >= MAX_XYCUT_DEPTH) return [items]
+
+  const region = computeRegion(items)
+
+  // Y축 분할 시도 (수평 공백 감지)
+  const ySplit = findYSplit(items, region, gapThreshold)
+  if (ySplit !== null) {
+    const upper = items.filter(i => i.y > ySplit)
+    const lower = items.filter(i => i.y <= ySplit)
+    // 빈 파티션 방어 — 한쪽이 비면 분할 의미 없음
+    if (upper.length > 0 && lower.length > 0 && upper.length < items.length) {
+      return [...xyCutOrder(upper, gapThreshold, depth + 1), ...xyCutOrder(lower, gapThreshold, depth + 1)]
+    }
+  }
+
+  // X축 분할 시도 (수직 공백 감지)
+  const xSplit = findXSplit(items, region, gapThreshold)
+  if (xSplit !== null) {
+    const left = items.filter(i => i.x + i.w / 2 < xSplit)
+    const right = items.filter(i => i.x + i.w / 2 >= xSplit)
+    if (left.length > 0 && right.length > 0 && left.length < items.length) {
+      return [...xyCutOrder(left, gapThreshold, depth + 1), ...xyCutOrder(right, gapThreshold, depth + 1)]
+    }
+  }
+
+  // 분할 불가 → 리프 노드
+  return [items]
+}
+
+function computeRegion(items: NormItem[]): TextRegion {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const i of items) {
+    if (i.x < minX) minX = i.x
+    if (i.y < minY) minY = i.y
+    if (i.x + i.w > maxX) maxX = i.x + i.w
+    if (i.y + i.h > maxY) maxY = i.y + i.h
+  }
+  return { items, minX, minY, maxX, maxY }
+}
+
+/** Y축 분할점 찾기 — 수평 공백 밴드 중 가장 넓은 갭 */
+function findYSplit(items: NormItem[], region: TextRegion, gapThreshold: number): number | null {
+  // 아이템을 Y좌표로 정렬 (내림차순 — 위에서 아래)
+  const sorted = [...items].sort((a, b) => b.y - a.y)
+  let bestGap = gapThreshold
+  let bestSplit: number | null = null
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prevBottom = sorted[i - 1].y - sorted[i - 1].h
+    const currTop = sorted[i].y
+    const gap = prevBottom - currTop
+    if (gap > bestGap) {
+      bestGap = gap
+      bestSplit = (prevBottom + currTop) / 2
+    }
+  }
+  return bestSplit
+}
+
+/** X축 분할점 찾기 — 수직 공백 밴드 중 가장 넓은 갭 */
+function findXSplit(items: NormItem[], region: TextRegion, gapThreshold: number): number | null {
+  const sorted = [...items].sort((a, b) => a.x - b.x)
+  let bestGap = gapThreshold
+  let bestSplit: number | null = null
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prevRight = sorted[i - 1].x + sorted[i - 1].w
+    const currLeft = sorted[i].x
+    const gap = currLeft - prevRight
+    if (gap > bestGap) {
+      bestGap = gap
+      bestSplit = (prevRight + currLeft) / 2
+    }
+  }
+  return bestSplit
+}
+
+// ═══════════════════════════════════════════════════════
+// 페이지 콘텐츠 추출 → IRBlock[] (v2: 바운딩 박스 + 페이지 번호)
+// ═══════════════════════════════════════════════════════
+
+/**
+ * 선 기반 테이블 감지를 우선 시도, 실패 시 기존 휴리스틱 fallback.
+ */
+function extractPageBlocksWithLines(
+  items: NormItem[],
+  pageNum: number,
+  opList: { fnArray: Uint32Array | number[]; argsArray: unknown[][] },
+  pageWidth: number,
+  pageHeight: number,
+): IRBlock[] {
+  if (items.length === 0) return []
+
+  // 1단계: PDF 그래픽 명령에서 선 추출
+  let { horizontals, verticals } = extractLines(opList.fnArray, opList.argsArray)
+  ;({ horizontals, verticals } = filterPageBorderLines(horizontals, verticals, pageWidth, pageHeight))
+
+  // 2단계: 선으로 테이블 그리드 구성
+  const grids = buildTableGrids(horizontals, verticals)
+
+  if (grids.length > 0) {
+    return extractBlocksWithGrids(items, pageNum, grids, horizontals, verticals)
+  }
+
+  // Fallback: 기존 휴리스틱 (선이 없는 PDF)
+  return extractPageBlocksFallback(items, pageNum)
+}
+
+/**
+ * 선 기반 그리드가 감지된 경우: 테이블 영역의 텍스트는 셀에 매핑,
+ * 나머지는 일반 텍스트 블록으로 처리.
+ */
+function extractBlocksWithGrids(
+  items: NormItem[],
+  pageNum: number,
+  grids: TableGrid[],
+  horizontals: import("./line-detector.js").LineSegment[],
+  verticals: import("./line-detector.js").LineSegment[],
+): IRBlock[] {
+  const blocks: IRBlock[] = []
+  const usedItems = new Set<NormItem>()
+
+  // 그리드를 Y좌표 내림차순 정렬 (위→아래)
+  const sortedGrids = [...grids].sort((a, b) => b.bbox.y2 - a.bbox.y2)
+
+  for (const grid of sortedGrids) {
+    // 그리드 영역 내 텍스트 아이템 수집
+    const tableItems: NormItem[] = []
+    const pad = 3
+    for (const item of items) {
+      if (usedItems.has(item)) continue
+      if (item.x >= grid.bbox.x1 - pad && item.x + item.w <= grid.bbox.x2 + pad &&
+          item.y >= grid.bbox.y1 - pad && item.y <= grid.bbox.y2 + pad) {
+        tableItems.push(item)
+        usedItems.add(item)
+      }
+    }
+
+    // 셀 추출
+    const cells = extractCells(grid, horizontals, verticals)
+    if (cells.length === 0) continue
+
+    // 텍스트→셀 매핑
+    const textItems: TextItem[] = tableItems.map(i => ({
+      text: i.text, x: i.x, y: i.y, w: i.w, h: i.h,
+      fontSize: i.fontSize, fontName: i.fontName,
+    }))
+    const cellTextMap = mapTextToCells(textItems, cells)
+
+    // IRTable 구성
+    const numRows = grid.rowYs.length - 1
+    const numCols = grid.colXs.length - 1
+    const irGrid: import("../types.js").IRCell[][] = Array.from(
+      { length: numRows },
+      () => Array.from({ length: numCols }, () => ({ text: "", colSpan: 1, rowSpan: 1 })),
+    )
+
+    for (const cell of cells) {
+      const textItems = cellTextMap.get(cell) || []
+      const text = cellTextToString(textItems)
+      irGrid[cell.row][cell.col] = {
+        text,
+        colSpan: cell.colSpan,
+        rowSpan: cell.rowSpan,
+      }
+    }
+
+    const irTable: IRTable = {
+      rows: numRows,
+      cols: numCols,
+      cells: irGrid,
+      hasHeader: numRows > 1,
+    }
+
+    blocks.push({
+      type: "table",
+      table: irTable,
+      pageNumber: pageNum,
+      bbox: {
+        page: pageNum,
+        x: grid.bbox.x1, y: grid.bbox.y1,
+        width: grid.bbox.x2 - grid.bbox.x1, height: grid.bbox.y2 - grid.bbox.y1,
+      },
+    })
+  }
+
+  // 테이블에 속하지 않은 나머지 텍스트 → 일반 블록
+  const remaining = items.filter(i => !usedItems.has(i))
+  if (remaining.length > 0) {
+    // 위→아래 순서로 정렬
+    remaining.sort((a, b) => b.y - a.y || a.x - b.x)
+
+    // 테이블 전/후 텍스트를 Y좌표 기준으로 적절히 배치
+    const textBlocks = detectListBlocks(extractPageBlocksFallback(remaining, pageNum))
+
+    // Y좌표 기반으로 테이블과 텍스트를 올바른 순서로 병합
+    const allBlocks = [...blocks, ...textBlocks]
+    allBlocks.sort((a, b) => {
+      const ay = a.bbox ? (a.bbox.y + a.bbox.height) : 0
+      const by = b.bbox ? (b.bbox.y + b.bbox.height) : 0
+      return by - ay // PDF는 y가 위가 큼 → 내림차순
+    })
+    return allBlocks
+  }
+
+  return blocks
+}
+
+/**
+ * 기존 휴리스틱 기반 페이지 블록 추출 (선이 없는 PDF 대비 fallback).
+ */
+function extractPageBlocksFallback(items: NormItem[], pageNum: number): IRBlock[] {
+  if (items.length === 0) return []
+
+  const blocks: IRBlock[] = []
+
+  // 1단계: 페이지 전체에서 컬럼 감지 (테이블 우선)
+  const allYLines = groupByY(items)
+  const columns = detectColumns(allYLines)
+
+  if (columns && columns.length >= 3) {
+    // 테이블 감지됨 → 기존 extractWithColumns 로직 사용 (XY-Cut 스킵)
+    const tableText = extractWithColumns(allYLines, columns)
+    const bbox = computeBBox(items, pageNum)
+    blocks.push({ type: "paragraph", text: tableText, pageNumber: pageNum, bbox, style: dominantStyle(items) })
+  } else {
+    // 테이블 없음 → XY-Cut으로 읽기 순서 결정
+    const allY = items.map(i => i.y)
+    const pageHeight = Math.max(...allY) - Math.min(...allY)
+    const gapThreshold = Math.max(15, pageHeight * 0.03)
+
+    const orderedGroups = xyCutOrder(items, gapThreshold)
+
+    for (const group of orderedGroups) {
+      if (group.length === 0) continue
+      const yLines = groupByY(group)
+
+      // 그룹 내에서도 컬럼 감지 시도 (소형 테이블)
+      const groupColumns = detectColumns(yLines)
+      if (groupColumns && groupColumns.length >= 3) {
+        const tableText = extractWithColumns(yLines, groupColumns)
+        const bbox = computeBBox(group, pageNum)
+        blocks.push({ type: "paragraph", text: tableText, pageNumber: pageNum, bbox, style: dominantStyle(group) })
+      } else {
+        for (const line of yLines) {
+          const text = mergeLineSimple(line)
+          if (!text.trim()) continue
+          const bbox = computeBBox(line, pageNum)
+          blocks.push({ type: "paragraph", text, pageNumber: pageNum, bbox, style: dominantStyle(line) })
+        }
+      }
+    }
+  }
+
+  return blocks
+}
+
+/** 아이템 그룹에서 바운딩 박스 계산 */
+function computeBBox(items: NormItem[], pageNum: number): BoundingBox {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const i of items) {
+    if (i.x < minX) minX = i.x
+    if (i.y < minY) minY = i.y
+    if (i.x + i.w > maxX) maxX = i.x + i.w
+    // h가 0인 경우 fontSize를 높이 대용으로 사용 (pdfjs가 height를 제공하지 않는 경우)
+    const effectiveH = i.h > 0 ? i.h : i.fontSize
+    if (i.y + effectiveH > maxY) maxY = i.y + effectiveH
+  }
+  return { page: pageNum, x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+}
+
+/** 아이템 그룹의 대표 스타일 (최빈 폰트 크기) */
+function dominantStyle(items: NormItem[]): { fontSize: number; fontName: string } | undefined {
+  if (items.length === 0) return undefined
+  // 최빈 폰트 크기 찾기
+  const freq = new Map<number, number>()
+  let maxCount = 0, dominantSize = 0
+  for (const i of items) {
+    if (i.fontSize <= 0) continue
+    const count = (freq.get(i.fontSize) || 0) + 1
+    freq.set(i.fontSize, count)
+    if (count > maxCount) { maxCount = count; dominantSize = i.fontSize }
+  }
+  if (dominantSize === 0) return undefined
+  // 대표 폰트명 (빈 문자열은 undefined로)
+  const fontName = items.find(i => i.fontSize === dominantSize)?.fontName || undefined
+  return { fontSize: dominantSize, fontName }
 }
 
 function normalizeItems(rawItems: PdfTextItem[]): NormItem[] {
   return rawItems
     .filter(i => typeof i.str === "string" && i.str.trim() !== "")
-    .map(i => ({
-      text: i.str.trim(),
-      x: Math.round(i.transform[4]),
-      y: Math.round(i.transform[5]),
-      w: Math.round(i.width),
-      h: Math.round(i.height),
-    }))
+    .map(i => {
+      // transform matrix: [scaleX, skewY, skewX, scaleY, translateX, translateY]
+      // 폰트 크기 ≈ scaleY의 절대값 (일반적으로 transform[3])
+      const scaleY = Math.abs(i.transform[3])
+      const scaleX = Math.abs(i.transform[0])
+      const fontSize = Math.round(Math.max(scaleY, scaleX))
+
+      return {
+        text: i.str.trim(),
+        x: Math.round(i.transform[4]),
+        y: Math.round(i.transform[5]),
+        w: Math.round(i.width),
+        h: Math.round(i.height),
+        fontSize,
+        fontName: i.fontName || "",
+        // 0pt 폰트이거나 너비 0 → hidden text (prompt injection 의심)
+        isHidden: fontSize === 0 || (i.width === 0 && i.str.trim().length > 0),
+      }
+    })
     .sort((a, b) => b.y - a.y || a.x - b.x)
 }
 
@@ -495,6 +901,8 @@ export function cleanPdfText(text: string): string {
       .replace(/^[\s]*[-–—]\s*\d+\s*[-–—][\s]*$/gm, "")
       .replace(/^\s*\d+\s*\/\s*\d+\s*$/gm, "")
   )
+    // NOTE: 한국어 어절 중간 끊김("기 준을")은 형태소 분석 없이 정규식으로 수리하기 어려움.
+    // 과매칭 위험이 높아 현재는 적용하지 않음.
     .replace(/\n{3,}/g, "\n\n")
     .trim()
 }
@@ -509,6 +917,41 @@ function isStandaloneHeader(line: string): boolean {
   return /^제\d+[조항호장절](\([^)]*\))?(\s+\S+){0,7}$/.test(line.trim())
 }
 
+// ═══════════════════════════════════════════════════════
+// 리스트 감지 — paragraph 블록 중 번호 패턴을 list 블록으로 변환
+// ═══════════════════════════════════════════════════════
+
+/**
+ * 연속된 paragraph 블록에서 번호 리스트 패턴을 감지하여 list 블록으로 변환.
+ * "비고" 헤더 뒤에 오는 "1.", "2." 패턴이 대표적.
+ */
+function detectListBlocks(blocks: IRBlock[]): IRBlock[] {
+  const result: IRBlock[] = []
+
+  for (let i = 0; i < blocks.length; i++) {
+    const block = blocks[i]
+
+    // paragraph에서 번호 리스트 패턴 감지
+    if (block.type === "paragraph" && block.text) {
+      const match = block.text.match(/^(\d+)\.\s/)
+      if (match) {
+        result.push({
+          ...block,
+          type: "list",
+          listType: "ordered",
+          // 원래 번호를 text에 보존 (blocksToMarkdown에서 그대로 출력)
+          text: block.text,
+        })
+        continue
+      }
+    }
+
+    result.push(block)
+  }
+
+  return result
+}
+
 function mergeKoreanLines(text: string): string {
   if (!text) return ""
   const lines = text.split("\n")
@@ -518,6 +961,11 @@ function mergeKoreanLines(text: string): string {
   for (let i = 1; i < lines.length; i++) {
     const prev = result[result.length - 1]
     const curr = lines[i]
+    // 마크다운 헤딩 라인(#)은 병합하지 않음
+    if (/^#{1,6}\s/.test(prev) || /^#{1,6}\s/.test(curr)) {
+      result.push(curr)
+      continue
+    }
     if (/[가-힣·,\-]$/.test(prev) && /^[가-힣(]/.test(curr) && !startsWithMarker(curr) && !isStandaloneHeader(prev)) {
       result[result.length - 1] = prev + " " + curr
     } else {

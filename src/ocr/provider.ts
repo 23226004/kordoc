@@ -42,7 +42,7 @@ export async function ocrPages(
       const imageData = await renderPageToPng(page)
       const text = await provider(imageData, i, "image/png")
       if (text.trim()) {
-        blocks.push({ type: "paragraph", text: text.trim() })
+        blocks.push({ type: "paragraph", text: text.trim(), pageNumber: i })
       }
     } catch {
       // OCR 실패한 페이지는 건너뜀
