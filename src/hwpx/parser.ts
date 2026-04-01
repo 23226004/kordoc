@@ -22,6 +22,9 @@ function clampSpan(val: number, max: number): number {
   return Math.max(1, Math.min(val, max))
 }
 
+/** XML DOM 재귀 최대 깊이 — 악성 파일의 스택 오버플로 방지 */
+const MAX_XML_DEPTH = 200
+
 interface TableState { rows: CellContext[][]; currentRow: CellContext[]; cell: CellContext | null }
 
 // ─── HWPX 스타일 정보 ──────────────────────────────
@@ -484,8 +487,10 @@ function parseSectionXml(xml: string, styleMap?: HwpxStyleMap, warnings?: ParseW
 function walkSection(
   node: Node, blocks: IRBlock[],
   tableCtx: TableState | null, tableStack: TableState[],
-  styleMap?: HwpxStyleMap, warnings?: ParseWarning[], sectionNum?: number
+  styleMap?: HwpxStyleMap, warnings?: ParseWarning[], sectionNum?: number,
+  depth: number = 0
 ): void {
+  if (depth > MAX_XML_DEPTH) return
   const children = node.childNodes
   if (!children) return
 
@@ -500,7 +505,7 @@ function walkSection(
       case "tbl": {
         if (tableCtx) tableStack.push(tableCtx)
         const newTable: TableState = { rows: [], currentRow: [], cell: null }
-        walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum)
+        walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum, depth + 1)
 
         if (newTable.rows.length > 0) {
           if (tableStack.length > 0) {
@@ -523,7 +528,7 @@ function walkSection(
       case "tr":
         if (tableCtx) {
           tableCtx.currentRow = []
-          walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
+          walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum, depth + 1)
           if (tableCtx.currentRow.length > 0) tableCtx.rows.push(tableCtx.currentRow)
           tableCtx.currentRow = []
         }
@@ -532,7 +537,7 @@ function walkSection(
       case "tc":
         if (tableCtx) {
           tableCtx.cell = { text: "", colSpan: 1, rowSpan: 1 }
-          walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
+          walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum, depth + 1)
           if (tableCtx.cell) {
             tableCtx.currentRow.push(tableCtx.cell)
             tableCtx.cell = null
@@ -564,7 +569,7 @@ function walkSection(
         }
         // <p> 내부의 <tbl>만 별도 처리 — extractParagraphInfo가 이미 텍스트를 추출했으므로
         // 전체 walkSection 재귀 대신 테이블/이미지 자식만 선택적으로 처리
-        tableCtx = walkParagraphChildren(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
+        tableCtx = walkParagraphChildren(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum, depth + 1)
         break
       }
 
@@ -576,7 +581,7 @@ function walkSection(
         break
 
       default:
-        walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum)
+        walkSection(el, blocks, tableCtx, tableStack, styleMap, warnings, sectionNum, depth + 1)
         break
     }
   }
@@ -586,8 +591,10 @@ function walkSection(
 function walkParagraphChildren(
   node: Node, blocks: IRBlock[],
   tableCtx: TableState | null, tableStack: TableState[],
-  styleMap?: HwpxStyleMap, warnings?: ParseWarning[], sectionNum?: number
+  styleMap?: HwpxStyleMap, warnings?: ParseWarning[], sectionNum?: number,
+  depth: number = 0
 ): TableState | null {
+  if (depth > MAX_XML_DEPTH) return tableCtx
   const children = node.childNodes
   if (!children) return tableCtx
   for (let i = 0; i < children.length; i++) {
@@ -599,7 +606,7 @@ function walkParagraphChildren(
     if (localTag === "tbl") {
       if (tableCtx) tableStack.push(tableCtx)
       const newTable: TableState = { rows: [], currentRow: [], cell: null }
-      walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum)
+      walkSection(el, blocks, newTable, tableStack, styleMap, warnings, sectionNum, depth + 1)
       if (newTable.rows.length > 0) {
         if (tableStack.length > 0) {
           const parentTable = tableStack.pop()!

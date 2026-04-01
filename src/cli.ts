@@ -19,6 +19,11 @@ program
   .option("--format <type>", "출력 형식: markdown (기본) 또는 json", "markdown")
   .option("--silent", "진행 메시지 숨기기")
   .action(async (files: string[], opts) => {
+    const validFormats = ["markdown", "json"]
+    if (!validFormats.includes(opts.format)) {
+      process.stderr.write(`[kordoc] 지원하지 않는 형식: ${opts.format} (markdown 또는 json)\n`)
+      process.exit(1)
+    }
     for (const filePath of files) {
       const absPath = resolve(filePath)
       const fileName = basename(absPath)

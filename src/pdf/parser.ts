@@ -429,8 +429,8 @@ function extractBlocksWithGrids(
     )
 
     for (const cell of cells) {
-      const textItems = cellTextMap.get(cell) || []
-      const text = cellTextToString(textItems)
+      const cellItems = cellTextMap.get(cell) || []
+      const text = cellTextToString(cellItems)
       irGrid[cell.row][cell.col] = {
         text,
         colSpan: cell.colSpan,
@@ -1135,7 +1135,7 @@ function mergeKoreanLines(text: string): string {
       result.push(curr)
       continue
     }
-    if (/[가-힣·,\-]$/.test(prev) && /^[가-힣(]/.test(curr) && !startsWithMarker(curr) && !isStandaloneHeader(prev)) {
+    if (/[가-힣·,\-]$/.test(prev) && /^[가-힣(]/.test(curr) && !curr.trimStart().startsWith("|") && !startsWithMarker(curr) && !isStandaloneHeader(prev)) {
       result[result.length - 1] = prev + " " + curr
     } else {
       result.push(curr)
