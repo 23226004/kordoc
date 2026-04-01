@@ -2,7 +2,7 @@
 
 **모두 파싱해버리겠다** — The Korean Document Platform.
 
-[![npm version](https://img.shields.io/badge/npm-v1.7.0-cb3837.svg)](https://www.npmjs.com/package/kordoc)
+[![npm version](https://img.shields.io/badge/npm-v1.7.1-cb3837.svg)](https://www.npmjs.com/package/kordoc)
 [![license](https://img.shields.io/npm/l/kordoc.svg)](https://github.com/chrisryugj/kordoc/blob/main/LICENSE)
 [![node](https://img.shields.io/node/v/kordoc.svg)](https://nodejs.org)
 
@@ -14,7 +14,7 @@
 
 ---
 
-## What's New in v1.7.0
+## What's New in v1.7.1
 
 - **Image Extraction (HWP/HWPX)** — Binary image extraction from ZIP entries and HWP5 BinData streams. Rendered as `![image](...)` in markdown output.
 - **Partial Parsing (Graceful Degradation)** — Single page failures no longer abort the whole document. Failed pages emit `PARTIAL_PARSE` warnings and parsing continues.
